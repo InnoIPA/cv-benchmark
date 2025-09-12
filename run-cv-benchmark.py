@@ -1188,7 +1188,7 @@ def main():
     parser.add_argument("--img-size", type=int, default=640, help="模型輸入尺寸")
     parser.add_argument("--conf", type=float, default=0.25, help="置信度閾值")
     parser.add_argument("--iou", type=float, default=0.5, help="IoU 閾值")
-    parser.add_argument("--device", type=str, default="auto", help="設備配置 (auto, cpu, cuda)")
+    parser.add_argument("--device", type=str, default="cuda", help="設備配置 (auto, cpu, cuda)")
     parser.add_argument("--output", type=str, help="輸出報告文件路徑")
     
     args = parser.parse_args()

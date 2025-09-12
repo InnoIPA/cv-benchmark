@@ -51,9 +51,6 @@ source venv/bin/activate
 
 # 4. 安裝依賴套件
 pip install -r requirements.txt
-
-# 5.（可選）安裝 CUDA 版本的 PyTorch
-pip install torch torchvision --index-url https://download.pytorch.org/whl/cu118
 ```
 
 ### 使用 Docker（推薦跨機器一致性）
