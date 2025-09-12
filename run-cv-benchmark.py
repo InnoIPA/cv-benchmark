@@ -1,0 +1,1233 @@
+#!/usr/bin/env python3
+"""
+固定Channel數量的多模型並行基準測試工具
+用戶設定的Channel數不會改變，用可載入的模型數量來處理所有Channel
+"""
+import argparse
+import os
+import sys
+import threading
+import time
+import psutil
+import json
+from time import perf_counter
+from typing import List, Tuple, Optional, Dict, Any
+from datetime import datetime
+import numpy as np
+import cv2
+import torch
+from collections import deque
+import queue
+
+try:
+    from ultralytics import YOLO
+except ImportError as e:
+    print(f"❌ 無法導入 ultralytics: {e}")
+    print("請安裝 ultralytics: pip install ultralytics")
+    sys.exit(1)
+
+
+class FixedChannelMetric:
+    """固定Channel性能指標收集器"""
+    
+    def __init__(self, channel_id: int = 0) -> None:
+        self.channel_id = channel_id
+        self.lock = threading.Lock()
+        
+        # 基本指標
+        self.num_frames: int = 0
+        self.total_proc_s: float = 0.0
+        self.start_time = time.time()
+        
+        # 性能歷史
+        self.processing_times: List[float] = []
+        self.fps_history: List[float] = []
+        
+        # 資源使用指標
+        self.cpu_usage: List[float] = []
+        self.memory_usage: List[float] = []
+        self.gpu_usage: List[float] = []
+        
+        # 檢測指標
+        self.detection_counts: List[int] = []
+        
+        # 模型分配信息
+        self.assigned_model_id: int = -1
+        self.model_shared: bool = False
+
+    def update(self, proc_s: float, detections: int = 0) -> None:
+        """更新性能指標"""
+        with self.lock:
+            self.num_frames += 1
+            self.total_proc_s += float(proc_s)
+            self.processing_times.append(proc_s)
+            
+            # 計算當前FPS
+            current_fps = 1.0 / proc_s if proc_s > 0 else 0.0
+            self.fps_history.append(current_fps)
+            
+            # 檢測指標
+            self.detection_counts.append(detections)
+            
+            # 系統資源監控
+            try:
+                self.cpu_usage.append(psutil.cpu_percent())
+                self.memory_usage.append(psutil.virtual_memory().percent)
+            except Exception:
+                self.cpu_usage.append(0.0)
+                self.memory_usage.append(0.0)
+            
+            # GPU監控
+            try:
+                if torch.cuda.is_available():
+                    # 使用 nvidia-ml-py 或直接檢查 GPU 記憶體使用率
+                    try:
+                        import pynvml
+                        pynvml.nvmlInit()
+                        handle = pynvml.nvmlDeviceGetHandleByIndex(0)  # 使用第一個GPU
+                        gpu_info = pynvml.nvmlDeviceGetUtilizationRates(handle)
+                        gpu_usage = gpu_info.gpu  # GPU 使用率百分比
+                        self.gpu_usage.append(gpu_usage)
+                    except ImportError:
+                        # 如果沒有 pynvml，使用記憶體使用率作為替代指標
+                        memory_allocated = torch.cuda.memory_allocated()
+                        memory_reserved = torch.cuda.memory_reserved()
+                        if memory_reserved > 0:
+                            gpu_usage = (memory_allocated / memory_reserved) * 100
+                        else:
+                            gpu_usage = 0.0
+                        self.gpu_usage.append(gpu_usage)
+                else:
+                    self.gpu_usage.append(0.0)
+            except Exception as e:
+                # 如果所有方法都失敗，使用記憶體使用率作為替代
+                try:
+                    if torch.cuda.is_available():
+                        memory_allocated = torch.cuda.memory_allocated()
+                        memory_total = torch.cuda.get_device_properties(0).total_memory
+                        gpu_usage = (memory_allocated / memory_total) * 100
+                        self.gpu_usage.append(gpu_usage)
+                    else:
+                        self.gpu_usage.append(0.0)
+                except:
+                    self.gpu_usage.append(0.0)
+
+    def get_fps(self) -> float:
+        """計算實際FPS"""
+        with self.lock:
+            if self.num_frames <= 0:
+                return 0.0
+            elapsed = time.time() - self.start_time
+            if elapsed <= 0:
+                return 0.0
+            return self.num_frames / elapsed
+
+    def get_latency_ms(self) -> float:
+        """計算平均延遲（毫秒）"""
+        with self.lock:
+            if self.num_frames <= 0:
+                return 0.0
+            return (self.total_proc_s / self.num_frames) * 1000.0
+
+    def get_throughput(self) -> float:
+        """計算總吞吐量（每秒處理的幀數）"""
+        with self.lock:
+            elapsed = time.time() - self.start_time
+            if elapsed <= 0:
+                return 0.0
+            return self.num_frames / elapsed
+
+    def get_avg_detections(self) -> float:
+        """計算平均檢測數量"""
+        with self.lock:
+            if not self.detection_counts:
+                return 0.0
+            return sum(self.detection_counts) / len(self.detection_counts)
+
+    def get_avg_cpu_usage(self) -> float:
+        """計算平均CPU使用率"""
+        with self.lock:
+            if not self.cpu_usage:
+                return 0.0
+            return sum(self.cpu_usage) / len(self.cpu_usage)
+
+    def get_avg_memory_usage(self) -> float:
+        """計算平均記憶體使用率"""
+        with self.lock:
+            if not self.memory_usage:
+                return 0.0
+            return sum(self.memory_usage) / len(self.memory_usage)
+
+    def get_avg_gpu_usage(self) -> float:
+        """計算平均GPU使用率"""
+        with self.lock:
+            if not self.gpu_usage:
+                return 0.0
+            return sum(self.gpu_usage) / len(self.gpu_usage)
+
+
+class FixedChannelBenchmark:
+    """固定Channel數量的多模型並行基準測試主類"""
+    
+    def __init__(self, 
+                 model_name: str = 'yolov8n.pt',
+                 device: str = 'auto',
+                 img_size: int = 640,
+                 conf_threshold: float = 0.25,
+                 iou_threshold: float = 0.5):
+        """初始化固定Channel基準測試器"""
+        self.model_name = model_name
+        self.device = self._parse_device(device)
+        self.img_size = img_size
+        self.conf_threshold = conf_threshold
+        self.iou_threshold = iou_threshold
+        
+        # 硬體規格檢測
+        self.hardware_specs = self._detect_hardware_specs()
+        
+        print(f"🚀 固定Channel多模型並行基準測試器初始化完成")
+        print(f"   • 模型: {model_name}")
+        print(f"   • 設備: {self.device}")
+        print(f"   • 圖片尺寸: {img_size}x{img_size}")
+        print(f"   • 置信度閾值: {conf_threshold}")
+        print(f"   • IoU 閾值: {iou_threshold}")
+        print(f"   • 硬體規格: {self.hardware_specs}")
+
+    def _parse_device(self, device: str) -> str:
+        """解析設備配置"""
+        if device == 'auto':
+            if torch.cuda.is_available():
+                return 'cuda'
+            else:
+                return 'cpu'
+        return device
+
+    def _detect_hardware_specs(self) -> Dict[str, Any]:
+        """檢測硬體規格"""
+        specs = {
+            'cpu_cores': psutil.cpu_count(logical=False),
+            'cpu_threads': psutil.cpu_count(logical=True),
+            'total_memory_gb': psutil.virtual_memory().total / (1024**3),
+            'cuda_available': torch.cuda.is_available(),
+            'gpu_count': 0,
+            'gpu_memory_gb': 0,
+            'gpu_name': 'Unknown',
+            'gpus': []
+        }
+        
+        if torch.cuda.is_available():
+            specs['gpu_count'] = torch.cuda.device_count()
+            if specs['gpu_count'] > 0:
+                # 檢測所有GPU
+                for i in range(specs['gpu_count']):
+                    gpu_props = torch.cuda.get_device_properties(i)
+                    gpu_info = {
+                        'id': i,
+                        'name': gpu_props.name,
+                        'memory_gb': gpu_props.total_memory / (1024**3),
+                        'compute_capability': f"{gpu_props.major}.{gpu_props.minor}"
+                    }
+                    specs['gpus'].append(gpu_info)
+                
+                # 保持向後兼容性
+                specs['gpu_memory_gb'] = specs['gpus'][0]['memory_gb']
+                specs['gpu_name'] = specs['gpus'][0]['name']
+        
+        return specs
+
+    def _estimate_model_memory_usage(self) -> float:
+        """估算單個模型的記憶體使用量（GB）"""
+        if 'nano' in self.model_name or 'n' in self.model_name:
+            return 0.5
+        elif 'small' in self.model_name or 's' in self.model_name:
+            return 1.0
+        elif 'medium' in self.model_name or 'm' in self.model_name:
+            return 1.5
+        elif 'large' in self.model_name or 'l' in self.model_name:
+            return 2.5
+        elif 'xlarge' in self.model_name or 'x' in self.model_name:
+            return 3.5
+        else:
+            return 1.5  # 預設值
+
+    def _calculate_max_models(self, requested_channels: int) -> int:
+        """計算最大可載入的模型數量（上限為Channel數量）"""
+        if self.device == 'cpu':
+            # CPU模式：基於CPU核心數，但不超過Channel數量
+            cpu_limit = self.hardware_specs['cpu_cores']
+            return min(requested_channels, cpu_limit)
+        
+        else:
+            # GPU模式：基於GPU記憶體，但不超過Channel數量
+            model_memory = self._estimate_model_memory_usage()
+            available_memory = self.hardware_specs['gpu_memory_gb']
+            
+            # 保留30%的記憶體給系統和其他進程
+            usable_memory = available_memory * 0.7
+            memory_limit = int(usable_memory / model_memory)
+            
+            # 模型數量上限為Channel數量，但考慮GPU運算能力
+            # 對於高解析度視頻，限制模型數量以避免運算瓶頸
+            if requested_channels <= 8:
+                # 8個Channel以下：每個Channel都有專屬模型
+                return min(requested_channels, max(1, memory_limit))
+            elif requested_channels <= 16:
+                # 16個Channel：限制為8個模型，避免運算瓶頸
+                return min(8, max(1, memory_limit))
+            else:
+                # 32個Channel以上：限制為16個模型，避免運算瓶頸
+                return min(16, max(1, memory_limit))
+
+    def _test_model_loading(self, num_models: int) -> Tuple[bool, List[float], List[float]]:
+        """測試載入指定數量的模型"""
+        print(f"🧪 測試載入 {num_models} 個模型...")
+        
+        models = []
+        load_times = []
+        memory_usage = []
+        
+        try:
+            for i in range(num_models):
+                print(f"   🔄 載入模型 {i+1}/{num_models}...")
+                
+                start_time = perf_counter()
+                model = YOLO(self.model_name)
+                
+                if self.device != 'cpu':
+                    model.to(self.device)
+                
+                load_time = perf_counter() - start_time
+                load_times.append(load_time)
+                
+                # 獲取記憶體使用量
+                if torch.cuda.is_available():
+                    mem_usage = torch.cuda.memory_allocated() / (1024**3)
+                    memory_usage.append(mem_usage)
+                else:
+                    memory_usage.append(0.0)
+                
+                models.append(model)
+                print(f"   ✅ 模型 {i+1} 載入完成，耗時: {load_time:.3f}秒")
+            
+            # 清理模型
+            for model in models:
+                del model
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            
+            return True, load_times, memory_usage
+            
+        except Exception as e:
+            print(f"   ❌ 載入失敗: {e}")
+            # 清理已載入的模型
+            for model in models:
+                try:
+                    del model
+                except:
+                    pass
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            
+            return False, load_times, memory_usage
+
+    def _find_max_loadable_models(self, requested_channels: int) -> Tuple[int, Dict[str, Any]]:
+        """尋找最大可載入的模型數量（上限為Channel數量）"""
+        print(f"\n🔍 尋找最大可載入模型數量...")
+        print(f"   • 請求Channel數: {requested_channels}")
+        
+        # 計算理論最大值（上限為Channel數量）
+        max_models = self._calculate_max_models(requested_channels)
+        print(f"   • 理論最大模型數: {max_models} (上限: {requested_channels})")
+        
+        if max_models <= 0:
+            print("   ❌ 硬體規格不足以載入任何模型")
+            return 0, {}
+        
+        # 從理論最大值開始，逐步遞減測試
+        for count in range(max_models, 0, -1):
+            print(f"\n   🧪 測試 {count} 個模型...")
+            
+            success, load_times, memory_usage = self._test_model_loading(count)
+            
+            if success:
+                print(f"   ✅ 成功載入 {count} 個模型")
+                print(f"   • 平均載入時間: {np.mean(load_times):.3f}秒")
+                print(f"   • 平均記憶體使用: {np.mean(memory_usage):.2f} GB")
+                
+                return count, {
+                    'load_times': load_times,
+                    'memory_usage': memory_usage,
+                    'avg_load_time': np.mean(load_times),
+                    'avg_memory_usage': np.mean(memory_usage),
+                    'total_memory_usage': np.sum(memory_usage)
+                }
+            else:
+                print(f"   ❌ 無法載入 {count} 個模型")
+        
+        print("   ❌ 無法載入任何模型")
+        return 0, {}
+
+    def _create_model_instance(self, model_id: int) -> Tuple[YOLO, float, float]:
+        """創建模型實例"""
+        print(f"🔄 載入模型實例 {model_id}...")
+        
+        start_time = perf_counter()
+        
+        try:
+            # 創建新的模型實例
+            yolo_model = YOLO(self.model_name)
+            
+            if self.device != 'cpu':
+                yolo_model.to(self.device)
+            
+            load_time = perf_counter() - start_time
+            
+            # 獲取模型記憶體使用量
+            memory_usage = 0.0
+            if torch.cuda.is_available():
+                memory_usage = torch.cuda.memory_allocated() / (1024**3)  # GB
+            
+            print(f"✅ 模型實例 {model_id} 載入完成，耗時: {load_time:.3f}秒")
+            
+            return yolo_model, load_time, memory_usage
+            
+        except Exception as e:
+            print(f"❌ 模型實例 {model_id} 載入失敗: {e}")
+            raise
+
+    def predict_single_frame(self, model: YOLO, frame: np.ndarray) -> Tuple[List[Dict], float]:
+        """對單一幀進行預測"""
+        t0 = perf_counter()
+        
+        try:
+            # 使用 YOLO 進行預測
+            results = model.predict(
+                source=frame,
+                conf=self.conf_threshold,
+                iou=self.iou_threshold,
+                imgsz=self.img_size,
+                verbose=False,
+                save=False
+            )
+            
+            t1 = perf_counter()
+            processing_time = t1 - t0
+            
+            # 處理結果
+            detections = []
+            for r in results:
+                if r.boxes is not None:
+                    boxes = r.boxes.xyxy.cpu().numpy()
+                    confidences = r.boxes.conf.cpu().numpy()
+                    classes = r.boxes.cls.cpu().numpy().astype(int)
+                    
+                    for i in range(len(boxes)):
+                        detection = {
+                            'class_id': int(classes[i]),
+                            'confidence': float(confidences[i]),
+                            'bbox': boxes[i].tolist(),
+                            'class_name': r.names[int(classes[i])]
+                        }
+                        detections.append(detection)
+            
+            return detections, processing_time
+            
+        except Exception as e:
+            print(f"⚠️ 預測錯誤: {e}")
+            return [], 0.0
+
+    def benchmark_video_fixed_channels(self, 
+                                      video_path: str, 
+                                      duration_seconds: int = 60,
+                                      requested_channels: int = 1,
+                                      fixed_models: Optional[int] = None,
+                                      output_file: Optional[str] = None) -> Dict[str, Any]:
+        """固定Channel數量的多模型並行視頻基準測試"""
+        # 記錄測試開始時間
+        test_start_time = time.time()
+        
+        print(f"🎬 開始固定Channel多模型並行視頻基準測試")
+        print(f"   • 視頻: {video_path}")
+        print(f"   • 持續時間: {duration_seconds}秒")
+        print(f"   • 請求Channel數: {requested_channels}")
+        
+        # 驗證視頻文件
+        if not os.path.isfile(video_path):
+            raise FileNotFoundError(f"視頻文件不存在: {video_path}")
+        
+        # 獲取視頻信息
+        video_info = self._get_video_info(video_path)
+        print(f"📹 視頻信息: {video_info['width']}x{video_info['height']}, {video_info['fps']:.2f} FPS")
+        
+        # 確定要載入的模型數量
+        if fixed_models is not None:
+            # 使用用戶指定的固定模型數量
+            max_models = fixed_models
+            print(f"\n🔧 使用固定模型數量: {max_models}")
+            print(f"   • 跳過自動計算，直接載入 {max_models} 個模型")
+            
+            # 測試載入指定數量的模型
+            success, load_times, memory_usage = self._test_model_loading(max_models)
+            if not success:
+                print(f"❌ 無法載入 {max_models} 個模型，測試終止")
+                return {}
+            
+            load_info = {
+                'load_times': load_times,
+                'memory_usage': memory_usage,
+                'avg_load_time': np.mean(load_times),
+                'avg_memory_usage': np.mean(memory_usage),
+                'total_memory_usage': np.sum(memory_usage)
+            }
+        else:
+            # 使用自動計算的模型數量
+            max_models, load_info = self._find_max_loadable_models(requested_channels)
+        
+        if max_models == 0:
+            print("❌ 無法載入任何模型，測試終止")
+            return {}
+        
+        print(f"\n🎯 模型分配策略:")
+        print(f"   • 請求Channel數: {requested_channels}")
+        print(f"   • 載入模型數: {max_models}")
+        
+        if fixed_models is not None:
+            print(f"   • 配置方式: 用戶指定固定模型數量")
+        else:
+            print(f"   • 配置方式: 自動計算模型數量")
+        
+        if max_models >= requested_channels:
+            print(f"   • 分配策略: 每個Channel都有專屬模型 (理想配置)")
+            channels_per_model = 1.0
+        else:
+            print(f"   • 分配策略: {max_models}個模型處理{requested_channels}個Channel")
+            channels_per_model = requested_channels / max_models
+            print(f"   • 每個模型處理: {channels_per_model:.1f}個Channel")
+            
+            # 解釋為什麼限制模型數量
+            if fixed_models is not None:
+                print(f"   • 原因: 用戶指定固定模型數量")
+            elif requested_channels > 8:
+                print(f"   • 原因: 避免GPU運算瓶頸，確保最佳性能")
+        
+        # 初始化Channel指標收集器
+        channel_metrics = [FixedChannelMetric(i) for i in range(requested_channels)]
+        
+        # 載入模型實例
+        print(f"\n🔄 載入 {max_models} 個模型實例...")
+        models = []
+        model_load_times = []
+        model_memory_usage = []
+        
+        for i in range(max_models):
+            model, load_time, memory_usage = self._create_model_instance(i)
+            models.append(model)
+            model_load_times.append(load_time)
+            model_memory_usage.append(memory_usage)
+        
+        print(f"✅ 所有模型載入完成，總耗時: {sum(model_load_times):.3f}秒")
+        
+        # 創建Channel分配映射
+        channel_to_model = {}
+        for channel_id in range(requested_channels):
+            if max_models >= requested_channels:
+                # 理想配置：每個Channel都有專屬模型
+                model_id = channel_id
+                channel_metrics[channel_id].model_shared = False
+            else:
+                # 模型共享：多個Channel共享模型
+                model_id = channel_id % max_models
+                channel_metrics[channel_id].model_shared = True
+            
+            channel_to_model[channel_id] = model_id
+            channel_metrics[channel_id].assigned_model_id = model_id
+        
+        print(f"📋 Channel分配映射:")
+        for channel_id in range(requested_channels):
+            model_id = channel_to_model[channel_id]
+            print(f"   • Channel {channel_id} → Model {model_id}")
+        
+        # 啟動Channel工作線程
+        threads = []
+        stop_ts = time.time() + duration_seconds
+        
+        print(f"\n🚀 啟動 {requested_channels} 個Channel工作線程...")
+        
+        for channel_id in range(requested_channels):
+            model_id = channel_to_model[channel_id]
+            thread = threading.Thread(
+                target=self._fixed_channel_worker_thread,
+                args=(channel_id, model_id, video_path, stop_ts, channel_metrics[channel_id], models[model_id]),
+                daemon=True
+            )
+            thread.start()
+            threads.append(thread)
+        
+        print("✅ 開始固定Channel性能監控\n")
+        
+        # 定期報告
+        self._fixed_channel_monitor_progress(channel_metrics, stop_ts)
+        
+        # 等待所有線程完成
+        for thread in threads:
+            thread.join(timeout=2.0)
+        
+        # 清理模型
+        for model in models:
+            del model
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        
+        # 計算總執行時間
+        test_end_time = time.time()
+        total_execution_time = test_end_time - test_start_time
+        
+        # 生成報告
+        config = {
+            'model': self.model_name,
+            'video': video_path,
+            'requested_channels': requested_channels,
+            'actual_models': max_models,
+            'channels_per_model': channels_per_model,
+            'fixed_models': fixed_models,
+            'img_size': self.img_size,
+            'video_resolution': f"{video_info['width']}x{video_info['height']}",
+            'video_fps': video_info['fps'],
+            'conf': self.conf_threshold,
+            'iou': self.iou_threshold,
+            'seconds': duration_seconds,
+            'device': self.device,
+            'model_load_time': sum(model_load_times),
+            'total_execution_time': total_execution_time,
+            'architecture': 'fixed_channel_multi_model_parallel',
+            'hardware_specs': self.hardware_specs,
+            'load_info': load_info,
+            'channel_allocation': channel_to_model
+        }
+        
+        report = self._generate_fixed_channel_report(channel_metrics, config)
+        self._print_fixed_channel_report(report)
+        
+        # 自動生成報告檔案名（如果沒有指定）
+        if not output_file:
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            model_name = os.path.splitext(os.path.basename(self.model_name))[0]
+            output_file = f"reports/cv_benchmark_{model_name}_{requested_channels}ch_{timestamp}.json"
+        
+        # 確保 reports 目錄存在
+        os.makedirs("reports", exist_ok=True)
+        
+        # 保存報告
+        self._save_report(report, output_file)
+        print(f"\n📄 詳細報告已保存至: {output_file}")
+        
+        return report
+
+    def auto_optimize_models(self, 
+                           video_path: str, 
+                           duration_seconds: int, 
+                           requested_channels: int,
+                           output_file: Optional[str] = None) -> Dict[str, Any]:
+        """自動優化模型數量，找到最佳平衡點"""
+        # 記錄優化測試開始時間
+        optimization_start_time = time.time()
+        
+        print(f"🚀 開始自動優化模型數量測試")
+        print(f"   • 視頻: {video_path}")
+        print(f"   • 持續時間: {duration_seconds}秒")
+        print(f"   • 請求Channel數: {requested_channels}")
+        
+        # 獲取視頻信息
+        video_info = self._get_video_info(video_path)
+        print(f"📹 視頻信息: {video_info['width']}x{video_info['height']}, {video_info['fps']:.2f} FPS")
+        
+        # 計算測試範圍
+        max_possible_models = min(requested_channels, 16)  # 限制最大測試數量
+        test_configs = []
+        
+        # 生成測試配置
+        if requested_channels <= 4:
+            # 小Channel數：測試1到Channel數
+            test_configs = list(range(1, requested_channels + 1))
+        elif requested_channels <= 8:
+            # 中等Channel數：測試1, 2, 4, 8
+            test_configs = [1, 2, 4, requested_channels]
+        else:
+            # 大Channel數：測試1, 2, 4, 8, 16
+            test_configs = [1, 2, 4, 8, min(16, requested_channels)]
+        
+        print(f"\n🔍 測試配置: {test_configs}")
+        
+        results = []
+        
+        for i, model_count in enumerate(test_configs, 1):
+            print(f"\n{'='*60}")
+            print(f"🧪 測試 {i}/{len(test_configs)}: {model_count} 個模型")
+            print(f"{'='*60}")
+            
+            try:
+                # 執行單次測試
+                result = self.benchmark_video_fixed_channels(
+                    video_path=video_path,
+                    duration_seconds=duration_seconds,
+                    requested_channels=requested_channels,
+                    fixed_models=model_count,
+                    output_file=None  # 不保存中間報告
+                )
+                
+                if result and 'performance_metrics' in result:
+                    perf = result['performance_metrics']
+                    config = result['configuration']
+                    
+                    # 提取關鍵指標
+                    avg_fps = perf['fps']['average']
+                    total_fps = perf['fps']['total']
+                    avg_latency = perf['latency_ms']['average']
+                    channels_per_model = config['channels_per_model']
+                    
+                    # 計算效率分數
+                    efficiency_score = self._calculate_efficiency_score(
+                        avg_fps, total_fps, avg_latency, 
+                        requested_channels, model_count, channels_per_model
+                    )
+                    
+                    test_result = {
+                        'model_count': model_count,
+                        'avg_fps': avg_fps,
+                        'total_fps': total_fps,
+                        'avg_latency': avg_latency,
+                        'channels_per_model': channels_per_model,
+                        'efficiency_score': efficiency_score,
+                        'is_ideal_config': model_count >= requested_channels
+                    }
+                    
+                    results.append(test_result)
+                    
+                    print(f"✅ 測試完成: {model_count}個模型")
+                    print(f"   • 平均FPS: {avg_fps:.2f}")
+                    print(f"   • 總FPS: {total_fps:.2f}")
+                    print(f"   • 平均延遲: {avg_latency:.2f}ms")
+                    print(f"   • 效率分數: {efficiency_score:.2f}")
+                    
+                else:
+                    print(f"❌ 測試失敗: {model_count}個模型")
+                    
+            except Exception as e:
+                print(f"❌ 測試錯誤: {model_count}個模型 - {e}")
+                continue
+        
+        # 分析結果並找到最佳配置
+        if not results:
+            print("❌ 所有測試都失敗了")
+            return {}
+        
+        best_config = self._find_best_configuration(results, requested_channels)
+        
+        # 生成優化報告
+        optimization_report = self._generate_optimization_report(
+            results, best_config, video_info, requested_channels
+        )
+        
+        # 顯示優化結果
+        self._print_optimization_report(optimization_report)
+        
+        # 自動生成優化報告檔案名（如果沒有指定）
+        if not output_file:
+            optimization_end_time = time.time()
+            total_optimization_time = optimization_end_time - optimization_start_time
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            model_name = os.path.splitext(os.path.basename(self.model_name))[0]
+            output_file = f"reports/cv_optimization_{model_name}_{requested_channels}ch_{timestamp}.json"
+        
+        # 確保 reports 目錄存在
+        os.makedirs("reports", exist_ok=True)
+        
+        # 保存報告
+        self._save_report(optimization_report, output_file)
+        print(f"\n📄 優化報告已保存至: {output_file}")
+        
+        return optimization_report
+
+    def _calculate_efficiency_score(self, avg_fps: float, total_fps: float, 
+                                  avg_latency: float, requested_channels: int, 
+                                  model_count: int, channels_per_model: float) -> float:
+        """計算效率分數"""
+        # 權重配置
+        fps_weight = 0.4      # FPS權重
+        latency_weight = 0.3  # 延遲權重
+        efficiency_weight = 0.3  # 效率權重
+        
+        # FPS分數 (0-100)
+        fps_score = min(100, (avg_fps / 30) * 100)  # 以30 FPS為滿分
+        
+        # 延遲分數 (0-100，延遲越低分數越高)
+        latency_score = max(0, 100 - (avg_latency / 100) * 100)  # 以100ms為基準
+        
+        # 效率分數 (0-100，模型利用率越高分數越高)
+        if channels_per_model >= 1.0:
+            efficiency_score = 100  # 理想配置
+        else:
+            efficiency_score = channels_per_model * 100  # 共享模型效率
+        
+        # 計算總分
+        total_score = (fps_score * fps_weight + 
+                      latency_score * latency_weight + 
+                      efficiency_score * efficiency_weight)
+        
+        return total_score
+
+    def _find_best_configuration(self, results: List[Dict], requested_channels: int) -> Dict:
+        """找到最佳配置"""
+        if not results:
+            return {}
+        
+        # 按效率分數排序
+        sorted_results = sorted(results, key=lambda x: x['efficiency_score'], reverse=True)
+        
+        # 找到最佳配置
+        best = sorted_results[0]
+        
+        # 分析配置類型
+        if best['is_ideal_config']:
+            config_type = "理想配置"
+            recommendation = "每個Channel都有專屬模型，性能最佳"
+        elif best['channels_per_model'] >= 2.0:
+            config_type = "高效共享"
+            recommendation = "模型共享效率高，適合高吞吐量應用"
+        else:
+            config_type = "平衡配置"
+            recommendation = "FPS和延遲的平衡點，適合大多數應用"
+        
+        best['config_type'] = config_type
+        best['recommendation'] = recommendation
+        
+        return best
+
+    def _generate_optimization_report(self, results: List[Dict], best_config: Dict, 
+                                    video_info: Dict, requested_channels: int) -> Dict:
+        """生成優化報告"""
+        report = {
+            "timestamp": datetime.now().isoformat(),
+            "sdk_info": {
+                "name": "Auto-Optimization Multi-Model Benchmark",
+                "version": "1.0.0",
+                "framework": "PyTorch + Ultralytics YOLO"
+            },
+            "test_configuration": {
+                "video": video_info,
+                "requested_channels": requested_channels,
+                "model": self.model_name,
+                "device": self.device,
+                "img_size": self.img_size
+            },
+            "test_results": results,
+            "best_configuration": best_config,
+            "optimization_summary": {
+                "total_tests": len(results),
+                "best_model_count": best_config.get('model_count', 0),
+                "best_avg_fps": best_config.get('avg_fps', 0),
+                "best_total_fps": best_config.get('total_fps', 0),
+                "best_latency": best_config.get('avg_latency', 0),
+                "efficiency_score": best_config.get('efficiency_score', 0),
+                "config_type": best_config.get('config_type', ''),
+                "recommendation": best_config.get('recommendation', '')
+            }
+        }
+        
+        return report
+
+    def _print_optimization_report(self, report: Dict):
+        """顯示優化報告"""
+        print(f"\n{'='*80}")
+        print(f"🎯 自動優化結果報告")
+        print(f"{'='*80}")
+        
+        # 最佳配置
+        best = report['best_configuration']
+        summary = report['optimization_summary']
+        test_config = report['test_configuration']
+        
+        print(f"\n🏆 最佳配置:")
+        print(f"  • 模型數量: {summary['best_model_count']}")
+        print(f"  • 配置類型: {summary['config_type']}")
+        print(f"  • 平均FPS: {summary['best_avg_fps']:.2f}")
+        print(f"  • 總FPS: {summary['best_total_fps']:.2f}")
+        print(f"  • 平均延遲: {summary['best_latency']:.2f}ms")
+        print(f"  • 效率分數: {summary['efficiency_score']:.2f}/100")
+        print(f"  • 建議: {summary['recommendation']}")
+        
+        # 所有測試結果
+        print(f"\n📊 所有測試結果:")
+        print(f"{'模型數':<8} {'平均FPS':<10} {'總FPS':<10} {'延遲(ms)':<12} {'效率分數':<10} {'配置類型'}")
+        print(f"{'-'*70}")
+        
+        for result in report['test_results']:
+            config_type = "理想" if result['is_ideal_config'] else "共享"
+            print(f"{result['model_count']:<8} {result['avg_fps']:<10.2f} {result['total_fps']:<10.2f} "
+                  f"{result['avg_latency']:<12.2f} {result['efficiency_score']:<10.2f} {config_type}")
+        
+        # 使用建議
+        print(f"\n💡 使用建議:")
+        print(f"  • 最佳指令: python fixed_channel_benchmark.py --video {test_config['video']['width']}x{test_config['video']['height']} --model {self.model_name} -n {test_config['requested_channels']} -m {summary['best_model_count']} -t 30")
+        print(f"  • 預期性能: 每個Channel約{summary['best_avg_fps']:.1f} FPS")
+        print(f"  • 總吞吐量: {summary['best_total_fps']:.1f} frames/sec")
+
+    def _fixed_channel_worker_thread(self, 
+                                   channel_id: int,
+                                   model_id: int,
+                                   video_path: str, 
+                                   stop_ts: float, 
+                                   metric: FixedChannelMetric,
+                                   model: YOLO):
+        """固定Channel工作線程函數"""
+        print(f"🔄 Channel {channel_id} 開始工作 (使用Model {model_id})")
+        
+        cap = cv2.VideoCapture(video_path)
+        if not cap.isOpened():
+            print(f"[Channel {channel_id}] 無法打開視頻: {video_path}")
+            return
+        
+        try:
+            while time.time() < stop_ts:
+                ret, frame = cap.read()
+                if not ret or frame is None:
+                    # 重新開始播放
+                    cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                    continue
+                
+                # 進行預測（使用分配的模型）
+                detections, proc_time = self.predict_single_frame(model, frame)
+                
+                # 更新指標
+                metric.update(proc_time, len(detections))
+                
+        except Exception as e:
+            print(f"[Channel {channel_id}] 錯誤: {e}")
+        finally:
+            cap.release()
+
+    def _get_video_info(self, video_path: str) -> Dict[str, Any]:
+        """獲取視頻信息"""
+        cap = cv2.VideoCapture(video_path)
+        if not cap.isOpened():
+            return {'width': 0, 'height': 0, 'fps': 0, 'frame_count': 0}
+        
+        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        fps = cap.get(cv2.CAP_PROP_FPS)
+        frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        
+        cap.release()
+        
+        return {
+            'width': width,
+            'height': height,
+            'fps': fps,
+            'frame_count': frame_count
+        }
+
+    def _fixed_channel_monitor_progress(self, metrics: List[FixedChannelMetric], stop_ts: float):
+        """固定Channel進度監控"""
+        last_emit_s = -1
+        
+        while time.time() < stop_ts:
+            elapsed = int(stop_ts - time.time())
+            now_s = int(time.time())
+            
+            if last_emit_s == -1 or (now_s - last_emit_s) >= 3:
+                last_emit_s = now_s
+                
+                for metric in metrics:
+                    fps = metric.get_fps()
+                    latency = metric.get_latency_ms()
+                    throughput = metric.get_throughput()
+                    detections = metric.get_avg_detections()
+                    cpu = metric.get_avg_cpu_usage()
+                    memory = metric.get_avg_memory_usage()
+                    gpu = metric.get_avg_gpu_usage()
+                    
+                    model_info = f"Model {metric.assigned_model_id}"
+                    
+                    print(
+                        f"Channel {metric.channel_id} ({model_info}): fps={fps:.3f}, latency={latency:.2f}ms, "
+                        f"detections={detections:.1f}, cpu={cpu:.1f}%, memory={memory:.1f}%, gpu={gpu:.1f}%"
+                    )
+                print("")
+            
+            time.sleep(0.5)
+
+    def _generate_fixed_channel_report(self, metrics: List[FixedChannelMetric], config: Dict) -> Dict[str, Any]:
+        """生成固定Channel報告"""
+        report = {
+            "timestamp": datetime.now().isoformat(),
+            "sdk_info": {
+                "name": "Fixed Channel Multi-Model Parallel Benchmark",
+                "version": "1.0.0",
+                "framework": "PyTorch + Ultralytics YOLO"
+            },
+            "configuration": config,
+            "summary": {
+                "total_channels": len(metrics),
+                "total_models": config['actual_models'],
+                "channels_per_model": config['channels_per_model'],
+                "total_frames": sum(m.num_frames for m in metrics),
+                "total_runtime": max(m.start_time for m in metrics) - min(m.start_time for m in metrics) if metrics else 0,
+                "model_load_time": config.get('model_load_time', 0)
+            },
+            "performance_metrics": {},
+            "hardware_analysis": {},
+            "optimization_recommendations": {}
+        }
+        
+        # 性能指標
+        if metrics:
+            fps_values = [m.get_fps() for m in metrics if m.get_fps() > 0]
+            latency_values = [m.get_latency_ms() for m in metrics if m.get_latency_ms() > 0]
+            throughput_values = [m.get_throughput() for m in metrics if m.get_throughput() > 0]
+            
+            # 資源使用率統計
+            cpu_values = [m.get_avg_cpu_usage() for m in metrics if m.get_avg_cpu_usage() > 0]
+            memory_values = [m.get_avg_memory_usage() for m in metrics if m.get_avg_memory_usage() > 0]
+            gpu_values = [m.get_avg_gpu_usage() for m in metrics if m.get_avg_gpu_usage() > 0]
+            
+            avg_fps = sum(fps_values) / len(fps_values) if fps_values else 0
+            total_fps = sum(fps_values) if fps_values else 0  # 所有Channel的FPS總和
+            total_throughput = sum(throughput_values) if throughput_values else 0  # 總吞吐量
+            
+            report["performance_metrics"] = {
+                "fps": {
+                    "average": avg_fps,
+                    "min": min(fps_values) if fps_values else 0,
+                    "max": max(fps_values) if fps_values else 0,
+                    "per_channel": fps_values,
+                    "total": total_fps
+                },
+                "latency_ms": {
+                    "average": sum(latency_values) / len(latency_values) if latency_values else 0,
+                    "min": min(latency_values) if latency_values else 0,
+                    "max": max(latency_values) if latency_values else 0,
+                    "per_channel": latency_values
+                },
+                "throughput": {
+                    "total": total_throughput,
+                    "per_channel": throughput_values
+                },
+                "resource_usage": {
+                    "cpu": {
+                        "average": sum(cpu_values) / len(cpu_values) if cpu_values else 0,
+                        "min": min(cpu_values) if cpu_values else 0,
+                        "max": max(cpu_values) if cpu_values else 0,
+                        "per_channel": cpu_values
+                    },
+                    "memory": {
+                        "average": sum(memory_values) / len(memory_values) if memory_values else 0,
+                        "min": min(memory_values) if memory_values else 0,
+                        "max": max(memory_values) if memory_values else 0,
+                        "per_channel": memory_values
+                    },
+                    "gpu": {
+                        "average": sum(gpu_values) / len(gpu_values) if gpu_values else 0,
+                        "min": min(gpu_values) if gpu_values else 0,
+                        "max": max(gpu_values) if gpu_values else 0,
+                        "per_channel": gpu_values
+                    }
+                }
+            }
+        
+        # 硬體分析
+        report["hardware_analysis"] = {
+            "hardware_specs": self.hardware_specs,
+            "channel_allocation": {
+                "requested_channels": config['requested_channels'],
+                "actual_models": config['actual_models'],
+                "channels_per_model": config['channels_per_model'],
+                "allocation_efficiency": min(100.0, config['actual_models'] / config['requested_channels'] * 100),
+                "is_ideal_config": config['actual_models'] >= config['requested_channels']
+            },
+            "memory_utilization": {
+                "estimated_model_memory": self._estimate_model_memory_usage(),
+                "total_used_memory": config.get('load_info', {}).get('total_memory_usage', 0),
+                "available_memory": self.hardware_specs.get('gpu_memory_gb', 0) if self.device != 'cpu' else self.hardware_specs.get('total_memory_gb', 0)
+            }
+        }
+        
+        # 優化建議
+        recommendations = []
+        
+        if config['actual_models'] >= config['requested_channels']:
+            recommendations.append("✅ 理想配置：每個Channel都有專屬模型")
+            recommendations.append("✅ 性能最佳：無模型共享，無資源競爭")
+        else:
+            recommendations.append(f"⚠️ 模型共享：每個模型處理 {config['channels_per_model']:.1f} 個Channel")
+            recommendations.append(f"⚠️ 硬體限制：只能載入 {config['actual_models']}/{config['requested_channels']} 個模型")
+            
+            if config['requested_channels'] > 8:
+                recommendations.append("💡 原因：GPU運算瓶頸，避免過多模型同時運行")
+                recommendations.append("💡 建議：使用更小的模型 (yolov8n) 以載入更多實例")
+                recommendations.append("💡 建議：考慮使用批次處理來提升效率")
+            else:
+                if self.device != 'cpu':
+                    recommendations.append("💡 建議：升級GPU記憶體以支援更多模型")
+                    recommendations.append("💡 建議：使用更小的模型 (yolov8n) 以載入更多實例")
+                else:
+                    recommendations.append("💡 建議：增加系統記憶體或使用GPU加速")
+        
+        report["optimization_recommendations"] = recommendations
+        
+        return report
+
+    def _print_fixed_channel_report(self, report: Dict[str, Any]):
+        """打印固定Channel報告"""
+        print("\n" + "="*80)
+        print("🚀 Innodisk Computer Vision Benchmark 測試報告 v1.0")
+        print("="*80)
+        
+        # 測試配置
+        config = report["configuration"]
+        print(f"\n📊 測試配置:")
+        print(f"  • 模型: {config['model']}")
+        print(f"  • 視頻: {config['video']}")
+        print(f"  • 請求Channel數: {config['requested_channels']}")
+        print(f"  • 實際模型數: {config['actual_models']}")
+        print(f"  • 每模型處理Channel數: {config['channels_per_model']:.1f}")
+        if config.get('fixed_models') is not None:
+            print(f"  • 固定模型數量: {config['fixed_models']} (用戶指定)")
+        print(f"  • 模型載入時間: {config['model_load_time']:.3f}秒")
+        print(f"  • 總執行時間: {config['total_execution_time']:.3f}秒")
+        print(f"  • 模型輸入尺寸: {config['img_size']}x{config['img_size']}")
+        print(f"  • 視頻解析度: {config['video_resolution']}")
+        print(f"  • 視頻FPS: {config['video_fps']:.2f}")
+        print(f"  • 置信度閾值: {config['conf']}")
+        print(f"  • IoU閾值: {config['iou']}")
+        print(f"  • 測試持續時間: {config['seconds']}秒")
+        print(f"  • 設備: {config['device']}")
+        
+        # 硬體規格
+        hw_specs = config['hardware_specs']
+        print(f"\n💻 硬體規格:")
+        print(f"  • CPU核心數: {hw_specs['cpu_cores']}")
+        print(f"  • CPU線程數: {hw_specs['cpu_threads']}")
+        print(f"  • 系統記憶體: {hw_specs['total_memory_gb']:.1f} GB")
+        if hw_specs['cuda_available']:
+            print(f"  • GPU數量: {hw_specs['gpu_count']}")
+            if hw_specs['gpu_count'] > 1:
+                # 多GPU環境：分別顯示每個GPU
+                for gpu in hw_specs['gpus']:
+                    print(f"  • GPU {gpu['id']}: {gpu['name']} ({gpu['memory_gb']:.1f} GB, Compute {gpu['compute_capability']})")
+            else:
+                # 單GPU環境：保持原有格式
+                print(f"  • GPU記憶體: {hw_specs['gpu_memory_gb']:.1f} GB")
+                print(f"  • GPU名稱: {hw_specs['gpu_name']}")
+        
+        # 性能指標
+        if "performance_metrics" in report and report["performance_metrics"]:
+            perf = report["performance_metrics"]
+            print(f"\n⚡ 性能指標:")
+            print(f"  • 平均每Channel FPS: {perf['fps']['average']:.2f}")
+            print(f"  • FPS範圍: {perf['fps']['min']:.2f} - {perf['fps']['max']:.2f}")
+            print(f"  • 總FPS (所有Channel合計): {perf['fps']['total']:.2f}")
+            print(f"  • 平均延遲: {perf['latency_ms']['average']:.2f}ms")
+            print(f"  • 延遲範圍: {perf['latency_ms']['min']:.2f} - {perf['latency_ms']['max']:.2f}ms")
+            
+            # 資源使用率統計
+            if "resource_usage" in perf:
+                res = perf["resource_usage"]
+                print(f"\n💻 資源使用率:")
+                print(f"  • CPU使用率: 平均 {res['cpu']['average']:.1f}% (範圍: {res['cpu']['min']:.1f}% - {res['cpu']['max']:.1f}%)")
+                print(f"  • 記憶體使用率: 平均 {res['memory']['average']:.1f}% (範圍: {res['memory']['min']:.1f}% - {res['memory']['max']:.1f}%)")
+                print(f"  • GPU使用率: 平均 {res['gpu']['average']:.1f}% (範圍: {res['gpu']['min']:.1f}% - {res['gpu']['max']:.1f}%)")
+        
+        # 硬體分析
+        hw_analysis = report["hardware_analysis"]
+        print(f"\n🔍 硬體分析:")
+        print(f"  • Channel分配: {hw_analysis['channel_allocation']['requested_channels']} → {hw_analysis['channel_allocation']['actual_models']} 模型")
+        print(f"  • 每模型處理: {hw_analysis['channel_allocation']['channels_per_model']:.1f} 個Channel")
+        print(f"  • 分配效率: {hw_analysis['channel_allocation']['allocation_efficiency']:.1f}%")
+        
+        if hw_analysis['channel_allocation']['is_ideal_config']:
+            print(f"  • 配置狀態: ✅ 理想配置 (每個Channel都有專屬模型)")
+        else:
+            print(f"  • 配置狀態: ⚠️ 模型共享 (多個Channel共享模型)")
+        
+        print(f"  • 估算模型記憶體: {hw_analysis['memory_utilization']['estimated_model_memory']:.1f} GB")
+        print(f"  • 總使用記憶體: {hw_analysis['memory_utilization']['total_used_memory']:.1f} GB")
+        print(f"  • 可用記憶體: {hw_analysis['memory_utilization']['available_memory']:.1f} GB")
+        
+        # 優化建議
+        if report["optimization_recommendations"]:
+            print(f"\n💡 優化建議:")
+            for i, recommendation in enumerate(report["optimization_recommendations"], 1):
+                print(f"  {i}. {recommendation}")
+        
+        # 效率分數計算說明
+        print(f"\n📊 效率分數計算說明:")
+        print(f"  效率分數是一個綜合評分系統 (總分100分)，用來評估不同模型配置的整體性能表現：")
+        print(f"  • FPS分數 (40%權重): 以30 FPS為滿分，計算公式: min(100, (平均FPS/30) × 100)")
+        print(f"  • 延遲分數 (30%權重): 以100ms為基準，延遲越低分數越高，計算公式: max(0, 100 - (平均延遲/100) × 100)")
+        print(f"  • 效率分數 (30%權重): 理想配置(每Channel專屬模型)為100分，共享模型為 channels_per_model × 100")
+        print(f"  • 總分計算: FPS分數×0.4 + 延遲分數×0.3 + 效率分數×0.3")
+        print(f"  • 分數意義: 0-30分(需優化) | 30-60分(可接受) | 60-80分(良好) | 80-100分(優秀)")
+        
+        print("\n" + "="*80)
+
+    def _save_report(self, report: Dict[str, Any], output_file: str):
+        """保存報告到文件"""
+        with open(output_file, 'w', encoding='utf-8') as f:
+            json.dump(report, f, indent=2, ensure_ascii=False)
+
+
+def main():
+    """主函數"""
+    parser = argparse.ArgumentParser(description="固定Channel數量的多模型並行基準測試工具")
+    parser.add_argument("--video", type=str, required=True, help="視頻文件路徑")
+    parser.add_argument("--model", type=str, default="yolov8n.pt", help="YOLO 模型名稱或路徑")
+    parser.add_argument("-n", "--channels", type=int, default=4, help="固定的並行Channel數（不會改變）")
+    parser.add_argument("-m", "--models", type=int, help="固定載入的模型數量（覆蓋自動計算）")
+    parser.add_argument("--auto-optimize", action="store_true", help="自動測試不同模型數量，找到最佳平衡點")
+    parser.add_argument("-t", "--seconds", type=int, default=60, help="測試持續時間（秒）")
+    parser.add_argument("--img-size", type=int, default=640, help="模型輸入尺寸")
+    parser.add_argument("--conf", type=float, default=0.25, help="置信度閾值")
+    parser.add_argument("--iou", type=float, default=0.5, help="IoU 閾值")
+    parser.add_argument("--device", type=str, default="auto", help="設備配置 (auto, cpu, cuda)")
+    parser.add_argument("--output", type=str, help="輸出報告文件路徑")
+    
+    args = parser.parse_args()
+    
+    try:
+        # 創建固定Channel基準測試器
+        benchmark = FixedChannelBenchmark(
+            model_name=args.model,
+            device=args.device,
+            img_size=args.img_size,
+            conf_threshold=args.conf,
+            iou_threshold=args.iou
+        )
+        
+        # 執行基準測試
+        if args.auto_optimize:
+            # 自動優化模式：測試不同模型數量
+            report = benchmark.auto_optimize_models(
+                video_path=args.video,
+                duration_seconds=args.seconds,
+                requested_channels=args.channels,
+                output_file=args.output
+            )
+        else:
+            # 單次測試模式
+            report = benchmark.benchmark_video_fixed_channels(
+                video_path=args.video,
+                duration_seconds=args.seconds,
+                requested_channels=args.channels,
+                fixed_models=args.models,
+                output_file=args.output
+            )
+        
+        print("\n✅ 固定Channel多模型並行基準測試完成！")
+        
+    except Exception as e:
+        print(f"❌ 基準測試失敗: {e}")
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
