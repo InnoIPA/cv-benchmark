@@ -34,23 +34,44 @@
 - NumPy 1.24+
 - Ultralytics 8.0+
 
-### 快速安裝
+### 快速安裝（本機環境）
 
 ```bash
 # 1. 克隆專案
 git clone <repository-url>
 cd cv-benchmark
 
-# 2. 創建虛擬環境
+# 2. 安裝 venv（通用）
+sudo apt update
+sudo apt install -y python3-venv
+
+# 3. 創建虛擬環境
 python3 -m venv venv
 source venv/bin/activate
 
-# 3. 安裝依賴套件
+# 4. 安裝依賴套件
 pip install -r requirements.txt
 
-```bash
-# 4. 安裝 CUDA 版本的 PyTorch
+# 5.（可選）安裝 CUDA 版本的 PyTorch
 pip install torch torchvision --index-url https://download.pytorch.org/whl/cu118
+```
+
+### 使用 Docker（推薦跨機器一致性）
+
+```bash
+# 1) 建置映像
+docker build -t cv-benchmark:latest .
+
+# 2) 以 GPU 執行（需要 NVIDIA 驅動與 nvidia-container-toolkit）
+docker run --rm --gpus all \
+  -v "$PWD/reports:/app/reports" \
+  -v "$PWD/videos:/app/videos" \
+  cv-benchmark:latest \
+  --video videos/car.mp4 --model yolov8n.pt -n 4 -t 30
+
+# 3) 其他範例
+docker run --rm --gpus all -v "$PWD/reports:/app/reports" -v "$PWD/videos:/app/videos" \
+  cv-benchmark:latest --video videos/car.mp4 --model yolov8m.pt -n 8 --auto-optimize
 ```
 
 ## 🚀 使用方法
