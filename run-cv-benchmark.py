@@ -611,6 +611,14 @@ class FixedChannelBenchmark:
         video_info = self._get_video_info(video_path)
         print(f"📹 視頻信息: {video_info['width']}x{video_info['height']}, {video_info['fps']:.2f} FPS")
         
+        # 創建唯一的報告目錄
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        model_name_base = os.path.splitext(os.path.basename(self.model_name))[0]
+        report_dir_name = f"cv_optimization_{model_name_base}_{requested_channels}ch_{timestamp}"
+        report_dir = os.path.join("reports", report_dir_name)
+        os.makedirs(report_dir, exist_ok=True)
+        print(f"📂 報告將儲存於: {report_dir}")
+        
         # 計算測試範圍
         max_possible_models = min(requested_channels, 16)  # 限制最大測試數量
         test_configs = []
@@ -636,18 +644,23 @@ class FixedChannelBenchmark:
             print(f"{'='*60}")
             
             try:
+                # 為中間報告生成檔案路徑
+                intermediate_report_name = f"benchmark_{model_count}_models.json"
+                intermediate_output_file = os.path.join(report_dir, intermediate_report_name)
+                
                 # 執行單次測試
                 result = self.benchmark_video_fixed_channels(
                     video_path=video_path,
                     duration_seconds=duration_seconds,
                     requested_channels=requested_channels,
                     fixed_models=model_count,
-                    output_file=None  # 不保存中間報告
+                    output_file=intermediate_output_file
                 )
                 
                 if result and 'performance_metrics' in result:
                     perf = result['performance_metrics']
                     config = result['configuration']
+                    resource_usage = perf.get('resource_usage', {})
                     
                     # 提取關鍵指標
                     avg_fps = perf['fps']['average']
@@ -657,7 +670,7 @@ class FixedChannelBenchmark:
                     
                     # 計算效率分數
                     efficiency_score = self._calculate_efficiency_score(
-                        avg_fps, total_fps, avg_latency, 
+                        avg_fps, total_fps, avg_latency,
                         requested_channels, model_count, channels_per_model
                     )
                     
@@ -668,7 +681,8 @@ class FixedChannelBenchmark:
                         'avg_latency': avg_latency,
                         'channels_per_model': channels_per_model,
                         'efficiency_score': efficiency_score,
-                        'is_ideal_config': model_count >= requested_channels
+                        'is_ideal_config': model_count >= requested_channels,
+                        'resource_usage': resource_usage
                     }
                     
                     results.append(test_result)
@@ -701,20 +715,13 @@ class FixedChannelBenchmark:
         # 顯示優化結果
         self._print_optimization_report(optimization_report)
         
-        # 自動生成優化報告檔案名（如果沒有指定）
-        if not output_file:
-            optimization_end_time = time.time()
-            total_optimization_time = optimization_end_time - optimization_start_time
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            model_name = os.path.splitext(os.path.basename(self.model_name))[0]
-            output_file = f"reports/cv_optimization_{model_name}_{requested_channels}ch_{timestamp}.json"
-        
-        # 確保 reports 目錄存在
-        os.makedirs("reports", exist_ok=True)
+        # 將最終優化報告儲存到專屬資料夾中
+        final_report_name = "optimization_report.json"
+        final_output_file = os.path.join(report_dir, final_report_name)
         
         # 保存報告
-        self._save_report(optimization_report, output_file)
-        print(f"\n📄 優化報告已保存至: {output_file}")
+        self._save_report(optimization_report, final_output_file)
+        print(f"\n📄 優化報告已保存至: {final_output_file}")
         
         return optimization_report
 
@@ -828,13 +835,18 @@ class FixedChannelBenchmark:
         
         # 所有測試結果
         print(f"\n📊 所有測試結果:")
-        print(f"{'模型數':<8} {'平均FPS':<10} {'總FPS':<10} {'延遲(ms)':<12} {'效率分數':<10} {'配置類型'}")
-        print(f"{'-'*70}")
+        print(f"{'模型數':<8} {'平均FPS':<10} {'總FPS':<10} {'延遲(ms)':<12} {'Avg CPU(%)':<12} {'Avg GPU(%)':<12} {'效率分數':<10} {'配置類型'}")
+        print(f"{'-'*95}")
         
         for result in report['test_results']:
             config_type = "理想" if result['is_ideal_config'] else "共享"
+            resource_usage = result.get('resource_usage', {})
+            avg_cpu = resource_usage.get('cpu', {}).get('average', 0.0)
+            avg_gpu = resource_usage.get('gpu', {}).get('average', 0.0)
+            
             print(f"{result['model_count']:<8} {result['avg_fps']:<10.2f} {result['total_fps']:<10.2f} "
-                  f"{result['avg_latency']:<12.2f} {result['efficiency_score']:<10.2f} {config_type}")
+                  f"{result['avg_latency']:<12.2f} {avg_cpu:<12.1f} {avg_gpu:<12.1f} "
+                  f"{result['efficiency_score']:<10.2f} {config_type}")
         
         # 使用建議
         print(f"\n💡 使用建議:")
