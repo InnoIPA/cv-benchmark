@@ -18,7 +18,7 @@ import cv2
 import torch
 from collections import deque
 import queue
-
+from torch.profiler import profile, record_function, ProfilerActivity
 try:
     import pynvml
 except ImportError:
@@ -54,6 +54,7 @@ class FixedChannelMetric:
         # 模型分配信息
         self.assigned_model_id: int = -1
         self.model_shared: bool = False
+        self.profiling_data: Dict[str, Any] = {}
 
     def update(self, proc_s: float, detections: int = 0) -> None:
         """更新性能指標"""
@@ -357,45 +358,143 @@ class FixedChannelBenchmark:
             raise
 
     def predict_single_frame(self, model: YOLO, frame: np.ndarray) -> Tuple[List[Dict], float]:
-        """對單一幀進行預測"""
-        t0 = perf_counter()
+        """
+        [宏觀測試用] 對單一幀進行預測，只返回檢測結果和總牆上時間（秒）。
+        Profiler 已被移除，以確保執行緒安全。
         
+        返回:
+            detections (List[Dict]): 檢測結果
+            processing_time_s (float): 總牆上時間 (秒)
+        """
+        t_wall_start = perf_counter()
+
         try:
-            # 使用 YOLO 進行預測
-            results = model.predict(
-                source=frame,
-                conf=self.conf_threshold,
-                iou=self.iou_threshold,
-                imgsz=self.img_size,
-                verbose=False,
-                save=False
-            )
-            
-            t1 = perf_counter()
-            processing_time = t1 - t0
-            
-            # 處理結果
+            # 1. 執行推論 (不使用 profiler)
+            with torch.inference_mode():
+                results = model.predict(
+                    source=frame,
+                    conf=self.conf_threshold,
+                    iou=self.iou_threshold,
+                    imgsz=self.img_size,
+                    verbose=False,
+                    save=False
+                )
+
+            # 2. CPU 後處理
             detections = []
-            for r in results:
-                if r.boxes is not None:
-                    boxes = r.boxes.xyxy.cpu().numpy()
-                    confidences = r.boxes.conf.cpu().numpy()
-                    classes = r.boxes.cls.cpu().numpy().astype(int)
-                    
-                    for i in range(len(boxes)):
-                        detection = {
-                            'class_id': int(classes[i]),
-                            'confidence': float(confidences[i]),
-                            'bbox': boxes[i].tolist(),
-                            'class_name': r.names[int(classes[i])]
-                        }
-                        detections.append(detection)
+            if results:
+                for r in results:
+                    if r.boxes is not None:
+                        boxes = r.boxes.xyxy.cpu().numpy()
+                        confidences = r.boxes.conf.cpu().numpy()
+                        classes = r.boxes.cls.cpu().numpy().astype(int)
+                        
+                        for i in range(len(boxes)):
+                            detection = {
+                                'class_id': int(classes[i]),
+                                'confidence': float(confidences[i]),
+                                'bbox': boxes[i].tolist(),
+                                'class_name': r.names[int(classes[i])]
+                            }
+                            detections.append(detection)
+
+            t_wall_end = perf_counter()
+            processing_time_s = t_wall_end - t_wall_start
             
-            return detections, processing_time
+            return detections, processing_time_s
             
         except Exception as e:
             print(f"⚠️ 預測錯誤: {e}")
             return [], 0.0
+
+    def _profile_model_once(self, model: YOLO) -> Dict[str, float]:
+        """
+        [微觀剖析用] 在主執行緒中對單一模型實例進行詳細剖析。
+        這會預熱並運行多次推論，以獲取穩定的 GPU 運算/I/O 理論值。
+        
+        返回:
+            Dict[str, float]: 包含 'gpu_compute_avg_ms', 'gpu_io_avg_ms', 'cpu_post_proc_avg_ms' 的字典
+        """
+        print(f"   🔬 [微觀剖析] 開始對 {self.model_name} 進行單模型理論值分析...")
+        
+        use_cuda = torch.cuda.is_available() and self.device != 'cpu'
+        if not use_cuda:
+            print("   ⚠️ [微觀剖析] 未使用 CUDA，跳過詳細剖析。")
+            return {}
+
+        # 創建一個符合 img_size 的假 (dummy) 圖像
+        dummy_frame = np.zeros((self.img_size, self.img_size, 3), dtype=np.uint8)
+        
+        warmup_runs = 20
+        profile_runs = 50
+        
+        results_compute: List[float] = []
+        results_io: List[float] = []
+        results_post_proc: List[float] = []
+
+        try:
+            # 1. 預熱 (Warm-up)
+            print(f"   🔬 [微觀剖析] 執行 {warmup_runs} 次預熱...")
+            with torch.inference_mode():
+                for _ in range(warmup_runs):
+                    _ = model.predict(source=dummy_frame, verbose=False)
+            
+            # 2. 剖析 (Profiling)
+            print(f"   🔬 [微觀剖析] 執行 {profile_runs} 次剖析...")
+            for _ in range(profile_runs):
+                gpu_compute_s = 0.0
+                gpu_io_s = 0.0
+                
+                with torch.inference_mode():
+                    with profile(
+                        activities=[ProfilerActivity.CUDA], # 我們只關心 CUDA 事件
+                        record_shapes=False,
+                        with_stack=False
+                    ) as prof:
+                        results = model.predict(
+                            source=dummy_frame,
+                            conf=self.conf_threshold,
+                            iou=self.iou_threshold,
+                            imgsz=self.img_size,
+                            verbose=False,
+                            save=False
+                        )
+                
+                # 提取 Profiler 數據
+                for event in prof.events():
+                    if "memcpy" in event.name.lower():
+                        gpu_io_s += event.cuda_time_total / 1_000_000.0  # us -> s
+                    elif "kernel" in event.name.lower():
+                        gpu_compute_s += event.cuda_time_total / 1_000_000.0 # us -> s
+                
+                # 測量 CPU 後處理
+                t_post_start = perf_counter()
+                if results:
+                    for r in results:
+                        _ = r.boxes.xyxy.cpu().numpy() # 模擬後處理
+                cpu_post_proc_s = perf_counter() - t_post_start
+                
+                results_compute.append(gpu_compute_s)
+                results_io.append(gpu_io_s)
+                results_post_proc.append(cpu_post_proc_s)
+            
+            # 3. 計算平均值並轉換為毫秒 (ms)
+            avg_compute_ms = (sum(results_compute) / len(results_compute)) * 1000
+            avg_io_ms = (sum(results_io) / len(results_io)) * 1000
+            avg_post_proc_ms = (sum(results_post_proc) / len(results_post_proc)) * 1000
+            
+            result_dict = {
+                "micro_gpu_compute_avg_ms": avg_compute_ms,
+                "micro_gpu_io_avg_ms": avg_io_ms,
+                "micro_cpu_post_proc_avg_ms": avg_post_proc_ms,
+                "micro_total_avg_ms": avg_compute_ms + avg_io_ms + avg_post_proc_ms
+            }
+            print(f"   ✅ [微觀剖析] 完成: {result_dict}")
+            return result_dict
+            
+        except Exception as e:
+            print(f"   ❌ [微觀剖析] 失敗: {e}")
+            return {}
 
     def benchmark_video_fixed_channels(self, 
                                       video_path: str, 
@@ -488,6 +587,13 @@ class FixedChannelBenchmark:
         
         print(f"✅ 所有模型載入完成，總耗時: {sum(model_load_times):.3f}秒")
         
+        # --- 執行一次微觀剖析 (任務 A) ---
+        micro_profiling_results = {}
+        if models:
+            micro_profiling_results = self._profile_model_once(models[0])
+        else:
+            print("   ⚠️ 沒有載入任何模型，跳過微觀剖析。")
+            
         # 創建Channel分配映射
         channel_to_model = {}
         for channel_id in range(requested_channels):
@@ -532,10 +638,10 @@ class FixedChannelBenchmark:
         
         # 定期報告
         self._fixed_channel_monitor_progress(channel_metrics, stop_ts)
-        
+
         # 等待所有線程完成
         for thread in threads:
-            thread.join(timeout=2.0)
+            thread.join()
 
         # 停止資源監控並獲取數據
         resource_monitor.stop()
@@ -552,7 +658,8 @@ class FixedChannelBenchmark:
         test_end_time = time.time()
         total_execution_time = test_end_time - test_start_time
         
-        # 生成報告
+        # --- 👇 這裡是修正點 #1 (失誤 #1) --- 👇
+        # 生成報告 (補上完整的 config 字典)
         config = {
             'model': self.model_name,
             'video': video_path,
@@ -575,7 +682,12 @@ class FixedChannelBenchmark:
             'channel_allocation': channel_to_model
         }
         
-        report = self._generate_fixed_channel_report(channel_metrics, config, resource_stats)
+        # 將微觀剖析結果 (micro_profiling_results) 傳遞給報告生成器
+        report = self._generate_fixed_channel_report(
+            channel_metrics, config, resource_stats, micro_profiling_results
+        )
+        # --- 👆 修正結束 --- 👆
+        
         self._print_fixed_channel_report(report)
         
         # 自動生成報告檔案名（如果沒有指定）
@@ -593,54 +705,43 @@ class FixedChannelBenchmark:
         
         return report
 
-    def auto_optimize_models(self, 
-                           video_path: str, 
-                           duration_seconds: int, 
-                           requested_channels: int,
-                           output_file: Optional[str] = None) -> Dict[str, Any]:
-        """自動優化模型數量，找到最佳平衡點"""
+    def run_auto_optimization(self, args: argparse.Namespace) -> Dict[str, Any]:
+        """
+        自動優化主函數，迭代不同的模型數量配置，執行測試，並生成最佳化報告。
+        """
         # 記錄優化測試開始時間
         optimization_start_time = time.time()
         
         print(f"🚀 開始自動優化模型數量測試")
-        print(f"   • 視頻: {video_path}")
-        print(f"   • 持續時間: {duration_seconds}秒")
-        print(f"   • 請求Channel數: {requested_channels}")
+        print(f"   • 視頻: {args.video}")
+        print(f"   • 持續時間: {args.seconds}秒")
+        print(f"   • 請求Channel數: {args.channels}")
         
         # 獲取視頻信息
-        video_info = self._get_video_info(video_path)
+        video_info = self._get_video_info(args.video)
         print(f"📹 視頻信息: {video_info['width']}x{video_info['height']}, {video_info['fps']:.2f} FPS")
         
         # 創建唯一的報告目錄
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         model_name_base = os.path.splitext(os.path.basename(self.model_name))[0]
-        report_dir_name = f"cv_optimization_{model_name_base}_{requested_channels}ch_{timestamp}"
-        report_dir = os.path.join("reports", report_dir_name)
+        
+        # 檢查是否有指定的 output_dir
+        output_dir = getattr(args, 'output_dir', 'reports')
+        
+        report_dir_name = f"cv_optimization_{model_name_base}_{args.channels}ch_{timestamp}"
+        report_dir = os.path.join(output_dir, report_dir_name)
         os.makedirs(report_dir, exist_ok=True)
         print(f"📂 報告將儲存於: {report_dir}")
         
-        # 計算測試範圍
-        max_possible_models = min(requested_channels, 16)  # 限制最大測試數量
-        test_configs = []
+        # 迭代測試邏輯
+        test_results = []
+        test_configs = list(range(1, args.channels + 1))
         
-        # 生成測試配置
-        if requested_channels <= 4:
-            # 小Channel數：測試1到Channel數
-            test_configs = list(range(1, requested_channels + 1))
-        elif requested_channels <= 8:
-            # 中等Channel數：測試1, 2, 4, 8
-            test_configs = [1, 2, 4, requested_channels]
-        else:
-            # 大Channel數：測試1, 2, 4, 8, 16
-            test_configs = [1, 2, 4, 8, min(16, requested_channels)]
-        
-        print(f"\n🔍 測試配置: {test_configs}")
-        
-        results = []
+        print(f"\n🔍 將執行 {len(test_configs)} 次測試，模型數量從 1 到 {args.channels}")
         
         for i, model_count in enumerate(test_configs, 1):
             print(f"\n{'='*60}")
-            print(f"🧪 測試 {i}/{len(test_configs)}: {model_count} 個模型")
+            print(f"🧪 測試 {i}/{len(test_configs)}: 使用 {model_count} 個模型")
             print(f"{'='*60}")
             
             try:
@@ -650,9 +751,9 @@ class FixedChannelBenchmark:
                 
                 # 執行單次測試
                 result = self.benchmark_video_fixed_channels(
-                    video_path=video_path,
-                    duration_seconds=duration_seconds,
-                    requested_channels=requested_channels,
+                    video_path=args.video,
+                    duration_seconds=args.seconds,
+                    requested_channels=args.channels,
                     fixed_models=model_count,
                     output_file=intermediate_output_file
                 )
@@ -671,21 +772,26 @@ class FixedChannelBenchmark:
                     # 計算效率分數
                     efficiency_score = self._calculate_efficiency_score(
                         avg_fps, total_fps, avg_latency,
-                        requested_channels, model_count, channels_per_model
+                        args.channels, model_count, channels_per_model
                     )
                     
-                    test_result = {
+                    summary = {
                         'model_count': model_count,
                         'avg_fps': avg_fps,
                         'total_fps': total_fps,
                         'avg_latency': avg_latency,
                         'channels_per_model': channels_per_model,
                         'efficiency_score': efficiency_score,
-                        'is_ideal_config': model_count >= requested_channels,
-                        'resource_usage': resource_usage
+                        'is_ideal_config': model_count >= args.channels,
+                        'resource_usage': resource_usage,
+                        'report_file': intermediate_report_name
                     }
                     
-                    results.append(test_result)
+                    # 如果存在 profiling_details，則將其複製到摘要中
+                    if 'profiling_details' in perf:
+                        summary['profiling_details'] = perf['profiling_details']
+                    
+                    test_results.append(summary)
                     
                     print(f"✅ 測試完成: {model_count}個模型")
                     print(f"   • 平均FPS: {avg_fps:.2f}")
@@ -701,15 +807,15 @@ class FixedChannelBenchmark:
                 continue
         
         # 分析結果並找到最佳配置
-        if not results:
-            print("❌ 所有測試都失敗了")
+        if not test_results:
+            print("❌ 所有測試都失敗了，無法生成優化報告")
             return {}
         
-        best_config = self._find_best_configuration(results, requested_channels)
+        best_config = self._find_best_configuration(test_results, args.channels)
         
         # 生成優化報告
         optimization_report = self._generate_optimization_report(
-            results, best_config, video_info, requested_channels
+            test_results, best_config, video_info, args.channels
         )
         
         # 顯示優化結果
@@ -854,39 +960,102 @@ class FixedChannelBenchmark:
         print(f"  • 預期性能: 每個Channel約{summary['best_avg_fps']:.1f} FPS")
         print(f"  • 總吞吐量: {summary['best_total_fps']:.1f} frames/sec")
 
-    def _fixed_channel_worker_thread(self, 
+    def _fixed_channel_worker_thread(self,
                                    channel_id: int,
                                    model_id: int,
-                                   video_path: str, 
-                                   stop_ts: float, 
+                                   video_path: str,
+                                   stop_ts: float,
                                    metric: FixedChannelMetric,
                                    model: YOLO):
-        """固定Channel工作線程函數"""
+        """固定Channel工作線程函數（生產者-消費者模式）"""
         print(f"🔄 Channel {channel_id} 開始工作 (使用Model {model_id})")
         
-        cap = cv2.VideoCapture(video_path)
-        if not cap.isOpened():
-            print(f"[Channel {channel_id}] 無法打開視頻: {video_path}")
-            return
+        frame_queue = queue.Queue(maxsize=10)
+        
+        # --- 生產者執行緒 ---
+        class ProducerThread(threading.Thread):
+            # ... (生產者程式碼保持不變) ...
+            def __init__(self, video_path, queue, stop_ts):
+                super().__init__()
+                self.daemon = True
+                self.video_path = video_path
+                self.queue = queue
+                self.stop_ts = stop_ts
+                self.read_times = []
+                self.put_q_times = []
+                self._stop_event = threading.Event()
+
+            def run(self):
+                cap = cv2.VideoCapture(self.video_path)
+                if not cap.isOpened():
+                    print(f"[Producer-{channel_id}] 無法打開視頻: {self.video_path}")
+                    return
+                
+                try:
+                    while time.time() < self.stop_ts and not self._stop_event.is_set():
+                        t_read_start = perf_counter()
+                        ret, frame = cap.read()
+                        t_read_end = perf_counter()
+                        self.read_times.append(t_read_end - t_read_start)
+
+                        if not ret:
+                            cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                            continue
+                        
+                        t_put_start = perf_counter()
+                        self.queue.put(frame)
+                        t_put_end = perf_counter()
+                        self.put_q_times.append(t_put_end - t_put_start)
+                finally:
+                    cap.release()
+                    # 發送結束信號
+                    self.queue.put(None)
+
+            def stop(self):
+                self._stop_event.set()
+
+        # --- 消費者邏輯 ---
+        consumer_get_q_times = []
+        consumer_predict_times = []
+
+        producer = ProducerThread(video_path, frame_queue, stop_ts)
+        producer.start()
         
         try:
-            while time.time() < stop_ts:
-                ret, frame = cap.read()
-                if not ret or frame is None:
-                    # 重新開始播放
-                    cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-                    continue
+            while True:
+                t_get_start = perf_counter()
+                frame = frame_queue.get()
+                t_get_end = perf_counter()
+                consumer_get_q_times.append(t_get_end - t_get_start)
+
+                if frame is None:
+                    break # 生產者已結束
+
+                # --- 👇 這裡是修改重點 --- 👇
+                # 接收 2 個返回值 (detections, proc_time_s)
+                detections, proc_time_s = self.predict_single_frame(model, frame)
                 
-                # 進行預測（使用分配的模型）
-                detections, proc_time = self.predict_single_frame(model, frame)
+                # 儲存總牆上時間 (wall_s)
+                consumer_predict_times.append({
+                    'wall_s': proc_time_s
+                })
+                # --- 👆 修改結束 --- 👆
                 
-                # 更新指標
-                metric.update(proc_time, len(detections))
+                metric.update(proc_time_s, len(detections))
                 
         except Exception as e:
-            print(f"[Channel {channel_id}] 錯誤: {e}")
+            print(f"[Channel {channel_id}] 消費者錯誤: {e}")
         finally:
-            cap.release()
+            producer.stop()
+            producer.join()
+            
+            # 回傳剖析數據
+            metric.profiling_data = {
+                'producer_read_times': producer.read_times,
+                'producer_put_q_times': producer.put_q_times,
+                'consumer_get_q_times': consumer_get_q_times,
+                'consumer_predict_times': consumer_predict_times
+            }
 
     def _get_video_info(self, video_path: str) -> Dict[str, Any]:
         """獲取視頻信息"""
@@ -935,7 +1104,11 @@ class FixedChannelBenchmark:
             
             time.sleep(0.5)
 
-    def _generate_fixed_channel_report(self, metrics: List[FixedChannelMetric], config: Dict, resource_stats: Dict) -> Dict[str, Any]:
+    def _generate_fixed_channel_report(self, 
+                                     metrics: List[FixedChannelMetric], 
+                                     config: Dict, 
+                                     resource_stats: Dict, 
+                                     micro_profiling: Dict[str, float]) -> Dict[str, Any]:
         """生成固定Channel報告"""
         report = {
             "timestamp": datetime.now().isoformat(),
@@ -958,7 +1131,8 @@ class FixedChannelBenchmark:
             "optimization_recommendations": {}
         }
         
-        # 性能指標
+        # --- 👇 這裡是修正點 #2 (失誤 #2) --- 👇
+        # 性能指標 (補上完整的 performance_metrics 字典)
         if metrics:
             fps_values = [m.get_fps() for m in metrics if m.get_fps() > 0]
             latency_values = [m.get_latency_ms() for m in metrics if m.get_latency_ms() > 0]
@@ -984,6 +1158,40 @@ class FixedChannelBenchmark:
                 },
                 "resource_usage": resource_stats
             }
+        # --- 👆 修正結束 --- 👆
+
+        # 微觀性能剖析 (合併 宏觀實測值(B) 和 微觀理論值(A))
+        profiling_details = {}
+        if metrics:
+            for m in metrics:
+                if m.profiling_data:
+                    def _avg_ms(data, key=None):
+                        if not data:
+                            return 0.0
+                        values = [d.get(key, 0) for d in data] if key else data
+                        return (sum(values) / len(values)) * 1000 if values else 0.0
+
+                    predict_times = m.profiling_data.get('consumer_predict_times', [])
+                    
+                    # 1. 獲取宏觀實測數據 (Task B)
+                    macro_data = {
+                        "macro_producer_read_avg_ms": _avg_ms(m.profiling_data.get('producer_read_times', [])),
+                        "macro_producer_put_q_avg_ms": _avg_ms(m.profiling_data.get('producer_put_q_times', [])),
+                        "macro_consumer_get_q_avg_ms": _avg_ms(m.profiling_data.get('consumer_get_q_times', [])),
+                        "macro_consumer_wall_avg_ms": _avg_ms(predict_times, key='wall_s'), # 這是總延遲
+                    }
+                    
+                    # 2. 存儲宏觀數據
+                    profiling_details[f"channel_{m.channel_id}"] = macro_data
+                    
+                    # 3. 併入微觀理論數據 (Task A)
+                    # (micro_profiling 是從 benchmark_video_fixed_channels 傳入的)
+                    profiling_details[f"channel_{m.channel_id}"].update(micro_profiling)
+
+        
+        # 將剖析數據加入到 performance_metrics 中
+        if profiling_details:
+            report["performance_metrics"]["profiling_details"] = profiling_details
         
         # 硬體分析
         report["hardware_analysis"] = {
@@ -996,7 +1204,7 @@ class FixedChannelBenchmark:
                 "is_ideal_config": config['actual_models'] >= config['requested_channels']
             },
             "memory_utilization": {
-                "estimated_model_memory": 0, # 已棄用
+                # "estimated_model_memory": 0, # 已棄用
                 "total_used_memory": config.get('load_info', {}).get('total_memory_usage', 0),
                 "available_memory": self.hardware_specs.get('gpu_memory_gb', 0) if self.device != 'cpu' else self.hardware_specs.get('total_memory_gb', 0)
             }
@@ -1134,16 +1342,22 @@ def main():
     parser.add_argument("--model", type=str, default="yolov8n.pt", help="YOLO 模型名稱或路徑")
     parser.add_argument("-n", "--channels", type=int, default=4, help="固定的並行Channel數（不會改變）")
     parser.add_argument("-m", "--models", type=int, help="固定載入的模型數量（覆蓋自動計算）")
-    parser.add_argument("--auto-optimize", action="store_true", help="自動測試不同模型數量，找到最佳平衡點")
+    parser.add_argument("--auto-optimize", action="store_true", help="自動測試從1到N個模型數量，找到最佳平衡點")
     parser.add_argument("-t", "--seconds", type=int, default=60, help="測試持續時間（秒）")
     parser.add_argument("--img-size", type=int, default=640, help="模型輸入尺寸")
     parser.add_argument("--conf", type=float, default=0.25, help="置信度閾值")
     parser.add_argument("--iou", type=float, default=0.5, help="IoU 閾值")
     parser.add_argument("--device", type=str, default="cuda", help="設備配置 (auto, cpu, cuda)")
-    parser.add_argument("--output", type=str, help="輸出報告文件路徑")
+    parser.add_argument("--output", type=str, help="輸出報告文件路徑 (單次測試) 或報告目錄 (自動優化)")
     
     args = parser.parse_args()
     
+    # 將 output 參數作為 output_dir 傳遞給自動優化
+    if args.output:
+        args.output_dir = args.output
+    else:
+        args.output_dir = "reports"
+
     try:
         # 創建固定Channel基準測試器
         benchmark = FixedChannelBenchmark(
@@ -1156,13 +1370,8 @@ def main():
         
         # 執行基準測試
         if args.auto_optimize:
-            # 自動優化模式：測試不同模型數量
-            report = benchmark.auto_optimize_models(
-                video_path=args.video,
-                duration_seconds=args.seconds,
-                requested_channels=args.channels,
-                output_file=args.output
-            )
+            # 自動優化模式：測試從1到N個模型數量
+            report = benchmark.run_auto_optimization(args)
         else:
             # 單次測試模式
             report = benchmark.benchmark_video_fixed_channels(
@@ -1173,7 +1382,7 @@ def main():
                 output_file=args.output
             )
         
-        print("\n✅ 固定Channel多模型並行基準測試完成！")
+        print("\n✅ 基準測試完成！")
         
     except Exception as e:
         print(f"❌ 基準測試失敗: {e}")
