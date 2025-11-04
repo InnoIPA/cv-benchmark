@@ -694,7 +694,7 @@ class FixedChannelBenchmark:
         if not output_file:
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             model_name = os.path.splitext(os.path.basename(self.model_name))[0]
-            output_file = f"reports/cv_benchmark_{model_name}_{requested_channels}ch_{timestamp}.json"
+            output_file = f"reports/cv_benchmark_{model_name}_pc_{requested_channels}ch_{timestamp}.json"
         
         # 確保 reports 目錄存在
         os.makedirs("reports", exist_ok=True)
