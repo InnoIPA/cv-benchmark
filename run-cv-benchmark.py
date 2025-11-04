@@ -20,6 +20,11 @@ from collections import deque
 import queue
 
 try:
+    import pynvml
+except ImportError:
+    pynvml = None
+
+try:
     from ultralytics import YOLO
 except ImportError as e:
     print(f"❌ 無法導入 ultralytics: {e}")
@@ -43,11 +48,6 @@ class FixedChannelMetric:
         self.processing_times: List[float] = []
         self.fps_history: List[float] = []
         
-        # 資源使用指標
-        self.cpu_usage: List[float] = []
-        self.memory_usage: List[float] = []
-        self.gpu_usage: List[float] = []
-        
         # 檢測指標
         self.detection_counts: List[int] = []
         
@@ -68,49 +68,6 @@ class FixedChannelMetric:
             
             # 檢測指標
             self.detection_counts.append(detections)
-            
-            # 系統資源監控
-            try:
-                self.cpu_usage.append(psutil.cpu_percent())
-                self.memory_usage.append(psutil.virtual_memory().percent)
-            except Exception:
-                self.cpu_usage.append(0.0)
-                self.memory_usage.append(0.0)
-            
-            # GPU監控
-            try:
-                if torch.cuda.is_available():
-                    # 使用 nvidia-ml-py 或直接檢查 GPU 記憶體使用率
-                    try:
-                        import pynvml
-                        pynvml.nvmlInit()
-                        handle = pynvml.nvmlDeviceGetHandleByIndex(0)  # 使用第一個GPU
-                        gpu_info = pynvml.nvmlDeviceGetUtilizationRates(handle)
-                        gpu_usage = gpu_info.gpu  # GPU 使用率百分比
-                        self.gpu_usage.append(gpu_usage)
-                    except ImportError:
-                        # 如果沒有 pynvml，使用記憶體使用率作為替代指標
-                        memory_allocated = torch.cuda.memory_allocated()
-                        memory_reserved = torch.cuda.memory_reserved()
-                        if memory_reserved > 0:
-                            gpu_usage = (memory_allocated / memory_reserved) * 100
-                        else:
-                            gpu_usage = 0.0
-                        self.gpu_usage.append(gpu_usage)
-                else:
-                    self.gpu_usage.append(0.0)
-            except Exception as e:
-                # 如果所有方法都失敗，使用記憶體使用率作為替代
-                try:
-                    if torch.cuda.is_available():
-                        memory_allocated = torch.cuda.memory_allocated()
-                        memory_total = torch.cuda.get_device_properties(0).total_memory
-                        gpu_usage = (memory_allocated / memory_total) * 100
-                        self.gpu_usage.append(gpu_usage)
-                    else:
-                        self.gpu_usage.append(0.0)
-                except:
-                    self.gpu_usage.append(0.0)
 
     def get_fps(self) -> float:
         """計算實際FPS"""
@@ -144,26 +101,71 @@ class FixedChannelMetric:
                 return 0.0
             return sum(self.detection_counts) / len(self.detection_counts)
 
-    def get_avg_cpu_usage(self) -> float:
-        """計算平均CPU使用率"""
-        with self.lock:
-            if not self.cpu_usage:
-                return 0.0
-            return sum(self.cpu_usage) / len(self.cpu_usage)
+class ResourceMonitor(threading.Thread):
+    """資源監控器，用於在測試期間收集系統資源使用情況"""
+    def __init__(self, sample_interval: float = 1.0):
+        super().__init__()
+        self.daemon = True
+        self._stop_event = threading.Event()
+        self.sample_interval = sample_interval
+        
+        self.cpu_usage: List[float] = []
+        self.memory_usage: List[float] = []
+        self.gpu_usage: List[float] = []
+        
+        self._pynvml_initialized = False
+        if pynvml:
+            try:
+                pynvml.nvmlInit()
+                self._pynvml_initialized = True
+            except pynvml.NVMLError:
+                print("⚠️ 無法初始化 pynvml，GPU 使用率將不會被監控。")
 
-    def get_avg_memory_usage(self) -> float:
-        """計算平均記憶體使用率"""
-        with self.lock:
-            if not self.memory_usage:
-                return 0.0
-            return sum(self.memory_usage) / len(self.memory_usage)
+    def run(self) -> None:
+        """在背景執行緒中定期收集資源數據"""
+        while not self._stop_event.is_set():
+            # 收集 CPU 和記憶體使用率
+            self.cpu_usage.append(psutil.cpu_percent())
+            self.memory_usage.append(psutil.virtual_memory().percent)
+            
+            # 收集 GPU 使用率
+            gpu_percent = 0.0
+            if self._pynvml_initialized:
+                try:
+                    handle = pynvml.nvmlDeviceGetHandleByIndex(0)
+                    util = pynvml.nvmlDeviceGetUtilizationRates(handle)
+                    gpu_percent = util.gpu
+                except pynvml.NVMLError:
+                    gpu_percent = 0.0 # 如果出錯，則記錄為0
+            self.gpu_usage.append(gpu_percent)
+            
+            time.sleep(self.sample_interval)
 
-    def get_avg_gpu_usage(self) -> float:
-        """計算平均GPU使用率"""
-        with self.lock:
-            if not self.gpu_usage:
-                return 0.0
-            return sum(self.gpu_usage) / len(self.gpu_usage)
+    def stop(self) -> None:
+        """停止資源監控"""
+        self._stop_event.set()
+        if self._pynvml_initialized:
+            try:
+                pynvml.nvmlShutdown()
+            except pynvml.NVMLError:
+                pass
+
+    def get_stats(self) -> Dict[str, Dict[str, float]]:
+        """計算並返回資源使用的統計數據"""
+        def _calculate(data: List[float]) -> Dict[str, float]:
+            if not data:
+                return {"average": 0.0, "min": 0.0, "max": 0.0}
+            return {
+                "average": float(np.mean(data)) if data else 0.0,
+                "min": float(np.min(data)) if data else 0.0,
+                "max": float(np.max(data)) if data else 0.0
+            }
+
+        return {
+            "cpu": _calculate(self.cpu_usage),
+            "memory": _calculate(self.memory_usage),
+            "gpu": _calculate(self.gpu_usage)
+        }
 
 
 class FixedChannelBenchmark:
@@ -235,48 +237,6 @@ class FixedChannelBenchmark:
         
         return specs
 
-    def _estimate_model_memory_usage(self) -> float:
-        """估算單個模型的記憶體使用量（GB）"""
-        if 'nano' in self.model_name or 'n' in self.model_name:
-            return 0.5
-        elif 'small' in self.model_name or 's' in self.model_name:
-            return 1.0
-        elif 'medium' in self.model_name or 'm' in self.model_name:
-            return 1.5
-        elif 'large' in self.model_name or 'l' in self.model_name:
-            return 2.5
-        elif 'xlarge' in self.model_name or 'x' in self.model_name:
-            return 3.5
-        else:
-            return 1.5  # 預設值
-
-    def _calculate_max_models(self, requested_channels: int) -> int:
-        """計算最大可載入的模型數量（上限為Channel數量）"""
-        if self.device == 'cpu':
-            # CPU模式：基於CPU核心數，但不超過Channel數量
-            cpu_limit = self.hardware_specs['cpu_cores']
-            return min(requested_channels, cpu_limit)
-        
-        else:
-            # GPU模式：基於GPU記憶體，但不超過Channel數量
-            model_memory = self._estimate_model_memory_usage()
-            available_memory = self.hardware_specs['gpu_memory_gb']
-            
-            # 保留30%的記憶體給系統和其他進程
-            usable_memory = available_memory * 0.7
-            memory_limit = int(usable_memory / model_memory)
-            
-            # 模型數量上限為Channel數量，但考慮GPU運算能力
-            # 對於高解析度視頻，限制模型數量以避免運算瓶頸
-            if requested_channels <= 8:
-                # 8個Channel以下：每個Channel都有專屬模型
-                return min(requested_channels, max(1, memory_limit))
-            elif requested_channels <= 16:
-                # 16個Channel：限制為8個模型，避免運算瓶頸
-                return min(8, max(1, memory_limit))
-            else:
-                # 32個Channel以上：限制為16個模型，避免運算瓶頸
-                return min(16, max(1, memory_limit))
 
     def _test_model_loading(self, num_models: int) -> Tuple[bool, List[float], List[float]]:
         """測試載入指定數量的模型"""
@@ -335,14 +295,15 @@ class FixedChannelBenchmark:
         print(f"\n🔍 尋找最大可載入模型數量...")
         print(f"   • 請求Channel數: {requested_channels}")
         
-        # 計算理論最大值（上限為Channel數量）
-        max_models = self._calculate_max_models(requested_channels)
-        print(f"   • 理論最大模型數: {max_models} (上限: {requested_channels})")
+        # 從請求的Channel數開始往下測試
+        max_models = requested_channels
+        print(f"   • 起始測試模型數: {max_models}")
         
         if max_models <= 0:
             print("   ❌ 硬體規格不足以載入任何模型")
             return 0, {}
         
+        # 從理論最大值開始，逐步遞減測試
         # 從理論最大值開始，逐步遞減測試
         for count in range(max_models, 0, -1):
             print(f"\n   🧪 測試 {count} 個模型...")
@@ -357,9 +318,9 @@ class FixedChannelBenchmark:
                 return count, {
                     'load_times': load_times,
                     'memory_usage': memory_usage,
-                    'avg_load_time': np.mean(load_times),
-                    'avg_memory_usage': np.mean(memory_usage),
-                    'total_memory_usage': np.sum(memory_usage)
+                    'avg_load_time': float(np.mean(load_times)) if load_times else 0.0,
+                    'avg_memory_usage': float(np.mean(memory_usage)) if memory_usage else 0.0,
+                    'total_memory_usage': float(np.sum(memory_usage)) if memory_usage else 0.0
                 }
             else:
                 print(f"   ❌ 無法載入 {count} 個模型")
@@ -475,9 +436,9 @@ class FixedChannelBenchmark:
             load_info = {
                 'load_times': load_times,
                 'memory_usage': memory_usage,
-                'avg_load_time': np.mean(load_times),
-                'avg_memory_usage': np.mean(memory_usage),
-                'total_memory_usage': np.sum(memory_usage)
+                'avg_load_time': float(np.mean(load_times)) if load_times else 0.0,
+                'avg_memory_usage': float(np.mean(memory_usage)) if memory_usage else 0.0,
+                'total_memory_usage': float(np.sum(memory_usage)) if memory_usage else 0.0
             }
         else:
             # 使用自動計算的模型數量
@@ -547,6 +508,10 @@ class FixedChannelBenchmark:
             model_id = channel_to_model[channel_id]
             print(f"   • Channel {channel_id} → Model {model_id}")
         
+        # 初始化並啟動資源監控器
+        resource_monitor = ResourceMonitor()
+        resource_monitor.start()
+
         # 啟動Channel工作線程
         threads = []
         stop_ts = time.time() + duration_seconds
@@ -571,6 +536,11 @@ class FixedChannelBenchmark:
         # 等待所有線程完成
         for thread in threads:
             thread.join(timeout=2.0)
+
+        # 停止資源監控並獲取數據
+        resource_monitor.stop()
+        resource_monitor.join()
+        resource_stats = resource_monitor.get_stats()
         
         # 清理模型
         for model in models:
@@ -605,7 +575,7 @@ class FixedChannelBenchmark:
             'channel_allocation': channel_to_model
         }
         
-        report = self._generate_fixed_channel_report(channel_metrics, config)
+        report = self._generate_fixed_channel_report(channel_metrics, config, resource_stats)
         self._print_fixed_channel_report(report)
         
         # 自動生成報告檔案名（如果沒有指定）
@@ -942,21 +912,18 @@ class FixedChannelBenchmark:
                     latency = metric.get_latency_ms()
                     throughput = metric.get_throughput()
                     detections = metric.get_avg_detections()
-                    cpu = metric.get_avg_cpu_usage()
-                    memory = metric.get_avg_memory_usage()
-                    gpu = metric.get_avg_gpu_usage()
                     
                     model_info = f"Model {metric.assigned_model_id}"
                     
                     print(
                         f"Channel {metric.channel_id} ({model_info}): fps={fps:.3f}, latency={latency:.2f}ms, "
-                        f"detections={detections:.1f}, cpu={cpu:.1f}%, memory={memory:.1f}%, gpu={gpu:.1f}%"
+                        f"detections={detections:.1f}"
                     )
                 print("")
             
             time.sleep(0.5)
 
-    def _generate_fixed_channel_report(self, metrics: List[FixedChannelMetric], config: Dict) -> Dict[str, Any]:
+    def _generate_fixed_channel_report(self, metrics: List[FixedChannelMetric], config: Dict, resource_stats: Dict) -> Dict[str, Any]:
         """生成固定Channel報告"""
         report = {
             "timestamp": datetime.now().isoformat(),
@@ -970,7 +937,7 @@ class FixedChannelBenchmark:
                 "total_channels": len(metrics),
                 "total_models": config['actual_models'],
                 "channels_per_model": config['channels_per_model'],
-                "total_frames": sum(m.num_frames for m in metrics),
+                "total_frames": int(sum(m.num_frames for m in metrics)),
                 "total_runtime": max(m.start_time for m in metrics) - min(m.start_time for m in metrics) if metrics else 0,
                 "model_load_time": config.get('model_load_time', 0)
             },
@@ -985,53 +952,25 @@ class FixedChannelBenchmark:
             latency_values = [m.get_latency_ms() for m in metrics if m.get_latency_ms() > 0]
             throughput_values = [m.get_throughput() for m in metrics if m.get_throughput() > 0]
             
-            # 資源使用率統計
-            cpu_values = [m.get_avg_cpu_usage() for m in metrics if m.get_avg_cpu_usage() > 0]
-            memory_values = [m.get_avg_memory_usage() for m in metrics if m.get_avg_memory_usage() > 0]
-            gpu_values = [m.get_avg_gpu_usage() for m in metrics if m.get_avg_gpu_usage() > 0]
-            
-            avg_fps = sum(fps_values) / len(fps_values) if fps_values else 0
-            total_fps = sum(fps_values) if fps_values else 0  # 所有Channel的FPS總和
-            total_throughput = sum(throughput_values) if throughput_values else 0  # 總吞吐量
-            
             report["performance_metrics"] = {
                 "fps": {
-                    "average": avg_fps,
-                    "min": min(fps_values) if fps_values else 0,
-                    "max": max(fps_values) if fps_values else 0,
+                    "average": float(np.mean(fps_values)) if fps_values else 0.0,
+                    "min": float(np.min(fps_values)) if fps_values else 0.0,
+                    "max": float(np.max(fps_values)) if fps_values else 0.0,
                     "per_channel": fps_values,
-                    "total": total_fps
+                    "total": float(np.sum(fps_values)) if fps_values else 0.0
                 },
                 "latency_ms": {
-                    "average": sum(latency_values) / len(latency_values) if latency_values else 0,
-                    "min": min(latency_values) if latency_values else 0,
-                    "max": max(latency_values) if latency_values else 0,
+                    "average": float(np.mean(latency_values)) if latency_values else 0.0,
+                    "min": float(np.min(latency_values)) if latency_values else 0.0,
+                    "max": float(np.max(latency_values)) if latency_values else 0.0,
                     "per_channel": latency_values
                 },
                 "throughput": {
-                    "total": total_throughput,
+                    "total": float(np.sum(throughput_values)) if throughput_values else 0.0,
                     "per_channel": throughput_values
                 },
-                "resource_usage": {
-                    "cpu": {
-                        "average": sum(cpu_values) / len(cpu_values) if cpu_values else 0,
-                        "min": min(cpu_values) if cpu_values else 0,
-                        "max": max(cpu_values) if cpu_values else 0,
-                        "per_channel": cpu_values
-                    },
-                    "memory": {
-                        "average": sum(memory_values) / len(memory_values) if memory_values else 0,
-                        "min": min(memory_values) if memory_values else 0,
-                        "max": max(memory_values) if memory_values else 0,
-                        "per_channel": memory_values
-                    },
-                    "gpu": {
-                        "average": sum(gpu_values) / len(gpu_values) if gpu_values else 0,
-                        "min": min(gpu_values) if gpu_values else 0,
-                        "max": max(gpu_values) if gpu_values else 0,
-                        "per_channel": gpu_values
-                    }
-                }
+                "resource_usage": resource_stats
             }
         
         # 硬體分析
@@ -1045,7 +984,7 @@ class FixedChannelBenchmark:
                 "is_ideal_config": config['actual_models'] >= config['requested_channels']
             },
             "memory_utilization": {
-                "estimated_model_memory": self._estimate_model_memory_usage(),
+                "estimated_model_memory": 0, # 已棄用
                 "total_used_memory": config.get('load_info', {}).get('total_memory_usage', 0),
                 "available_memory": self.hardware_specs.get('gpu_memory_gb', 0) if self.device != 'cpu' else self.hardware_specs.get('total_memory_gb', 0)
             }
@@ -1149,7 +1088,7 @@ class FixedChannelBenchmark:
         else:
             print(f"  • 配置狀態: ⚠️ 模型共享 (多個Channel共享模型)")
         
-        print(f"  • 估算模型記憶體: {hw_analysis['memory_utilization']['estimated_model_memory']:.1f} GB")
+        # print(f"  • 估算模型記憶體: {hw_analysis['memory_utilization']['estimated_model_memory']:.1f} GB") # 已棄用
         print(f"  • 總使用記憶體: {hw_analysis['memory_utilization']['total_used_memory']:.1f} GB")
         print(f"  • 可用記憶體: {hw_analysis['memory_utilization']['available_memory']:.1f} GB")
         
@@ -1188,7 +1127,7 @@ def main():
     parser.add_argument("--img-size", type=int, default=640, help="模型輸入尺寸")
     parser.add_argument("--conf", type=float, default=0.25, help="置信度閾值")
     parser.add_argument("--iou", type=float, default=0.5, help="IoU 閾值")
-    parser.add_argument("--device", type=str, default="auto", help="設備配置 (auto, cpu, cuda)")
+    parser.add_argument("--device", type=str, default="cuda", help="設備配置 (auto, cpu, cuda)")
     parser.add_argument("--output", type=str, help="輸出報告文件路徑")
     
     args = parser.parse_args()
