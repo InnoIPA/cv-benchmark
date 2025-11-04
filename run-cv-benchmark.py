@@ -694,7 +694,7 @@ class FixedChannelBenchmark:
         if not output_file:
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             model_name = os.path.splitext(os.path.basename(self.model_name))[0]
-            output_file = f"reports/cv_benchmark_{model_name}_pc_{requested_channels}ch_{timestamp}.json"
+            output_file = f"reports/cv_benchmark_{model_name}_st_{requested_channels}ch_{timestamp}.json"
         
         # 確保 reports 目錄存在
         os.makedirs("reports", exist_ok=True)
@@ -967,94 +967,57 @@ class FixedChannelBenchmark:
                                    stop_ts: float,
                                    metric: FixedChannelMetric,
                                    model: YOLO):
-        """固定Channel工作線程函數（生產者-消費者模式）"""
-        print(f"🔄 Channel {channel_id} 開始工作 (使用Model {model_id})")
+        """
+        [NEW] 固定Channel工作線程函數 (改回「單一執行緒」依序模式)
+        (已移除 生產者-消費者 架構)
+        """
+        print(f"🔄 Channel {channel_id} (單一執行緒模式) 開始工作 (使用Model {model_id})")
         
-        frame_queue = queue.Queue(maxsize=10)
-        
-        # --- 生產者執行緒 ---
-        class ProducerThread(threading.Thread):
-            # ... (生產者程式碼保持不變) ...
-            def __init__(self, video_path, queue, stop_ts):
-                super().__init__()
-                self.daemon = True
-                self.video_path = video_path
-                self.queue = queue
-                self.stop_ts = stop_ts
-                self.read_times = []
-                self.put_q_times = []
-                self._stop_event = threading.Event()
-
-            def run(self):
-                cap = cv2.VideoCapture(self.video_path)
-                if not cap.isOpened():
-                    print(f"[Producer-{channel_id}] 無法打開視頻: {self.video_path}")
-                    return
-                
-                try:
-                    while time.time() < self.stop_ts and not self._stop_event.is_set():
-                        t_read_start = perf_counter()
-                        ret, frame = cap.read()
-                        t_read_end = perf_counter()
-                        self.read_times.append(t_read_end - t_read_start)
-
-                        if not ret:
-                            cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-                            continue
-                        
-                        t_put_start = perf_counter()
-                        self.queue.put(frame)
-                        t_put_end = perf_counter()
-                        self.put_q_times.append(t_put_end - t_put_start)
-                finally:
-                    cap.release()
-                    # 發送結束信號
-                    self.queue.put(None)
-
-            def stop(self):
-                self._stop_event.set()
-
-        # --- 消費者邏輯 ---
-        consumer_get_q_times = []
-        consumer_predict_times = []
-
-        producer = ProducerThread(video_path, frame_queue, stop_ts)
-        producer.start()
+        # 1. 初始化 (Init)
+        # 每個執行緒現在都開啟「自己 (じぶん)」的影片捕獲
+        cap = cv2.VideoCapture(video_path)
+        if not cap.isOpened():
+            print(f"[Channel {channel_id}] 無法打開視頻: {video_path}")
+            return
+            
+        # 2. 準備收集新的「剖析 (Profiling)」數據
+        read_times = []
+        predict_times = []
         
         try:
-            while True:
-                t_get_start = perf_counter()
-                frame = frame_queue.get()
-                t_get_end = perf_counter()
-                consumer_get_q_times.append(t_get_end - t_get_start)
+            while time.time() < stop_ts:
+                
+                # --- [A] 任務 A (I/O 任務) ---
+                t_read_start = perf_counter()
+                ret, frame = cap.read()
+                t_read_end = perf_counter()
+                read_time_s = t_read_end - t_read_start
+                read_times.append(read_time_s)
 
-                if frame is None:
-                    break # 生產者已結束
-
-                # --- 👇 這裡是修改重點 --- 👇
-                # 接收 2 個返回值 (detections, proc_time_s)
+                if not ret:
+                    cap.set(cv2.CAP_PROP_POS_FRAMES, 0) # 影片重播 (Replay)
+                    continue
+                
+                # --- [B] 任務 B (推論任務) ---
+                # (predict_single_frame 已經被我們簡化過了，只返回 2 個值)
                 detections, proc_time_s = self.predict_single_frame(model, frame)
+                predict_times.append(proc_time_s)
                 
-                # 儲存總牆上時間 (wall_s)
-                consumer_predict_times.append({
-                    'wall_s': proc_time_s
-                })
-                # --- 👆 修改結束 --- 👆
-                
-                metric.update(proc_time_s, len(detections))
+                # --- [C] 更新總指標 (Update Metrics) ---
+                # [關鍵！] 總延遲 (Total Latency) 現在是 A + B
+                total_loop_time_s = read_time_s + proc_time_s
+                metric.update(total_loop_time_s, len(detections))
                 
         except Exception as e:
-            print(f"[Channel {channel_id}] 消費者錯誤: {e}")
+            print(f"[Channel {channel_id}] 工作線程錯誤: {e}")
         finally:
-            producer.stop()
-            producer.join()
+            cap.release()
             
-            # 回傳剖析數據
+            # 回傳新的剖析數據 (Profiling Data)
+            # 我們不再 (no longer) 有 'put_q' 或 'get_q'
             metric.profiling_data = {
-                'producer_read_times': producer.read_times,
-                'producer_put_q_times': producer.put_q_times,
-                'consumer_get_q_times': consumer_get_q_times,
-                'consumer_predict_times': consumer_predict_times
+                'st_read_times': read_times,      # ST = Single-Thread
+                'st_predict_times': predict_times # ST = Single-Thread
             }
 
     def _get_video_info(self, video_path: str) -> Dict[str, Any]:
@@ -1112,6 +1075,7 @@ class FixedChannelBenchmark:
         """生成固定Channel報告"""
         report = {
             "timestamp": datetime.now().isoformat(),
+            # ... (sdk_info, configuration, summary 內容不變) ...
             "sdk_info": {
                 "name": "Fixed Channel Multi-Model Parallel Benchmark",
                 "version": "1.0.0",
@@ -1131,8 +1095,7 @@ class FixedChannelBenchmark:
             "optimization_recommendations": {}
         }
         
-        # --- 👇 這裡是修正點 #2 (失誤 #2) --- 👇
-        # 性能指標 (補上完整的 performance_metrics 字典)
+        # 性能指標 (這一段不變)
         if metrics:
             fps_values = [m.get_fps() for m in metrics if m.get_fps() > 0]
             latency_values = [m.get_latency_ms() for m in metrics if m.get_latency_ms() > 0]
@@ -1158,9 +1121,9 @@ class FixedChannelBenchmark:
                 },
                 "resource_usage": resource_stats
             }
-        # --- 👆 修正結束 --- 👆
 
-        # 微觀性能剖析 (合併 宏觀實測值(B) 和 微觀理論值(A))
+        # --- 👇 這裡是修改重點 (しゅうせい) --- 👇
+        # 微觀性能剖析 (Profiling)
         profiling_details = {}
         if metrics:
             for m in metrics:
@@ -1170,30 +1133,26 @@ class FixedChannelBenchmark:
                             return 0.0
                         values = [d.get(key, 0) for d in data] if key else data
                         return (sum(values) / len(values)) * 1000 if values else 0.0
-
-                    predict_times = m.profiling_data.get('consumer_predict_times', [])
                     
-                    # 1. 獲取宏觀實測數據 (Task B)
+                    # 1. 獲取 [NEW] 單一執行緒 (ST) 實測數據
                     macro_data = {
-                        "macro_producer_read_avg_ms": _avg_ms(m.profiling_data.get('producer_read_times', [])),
-                        "macro_producer_put_q_avg_ms": _avg_ms(m.profiling_data.get('producer_put_q_times', [])),
-                        "macro_consumer_get_q_avg_ms": _avg_ms(m.profiling_data.get('consumer_get_q_times', [])),
-                        "macro_consumer_wall_avg_ms": _avg_ms(predict_times, key='wall_s'), # 這是總延遲
+                        # 我們現在讀取 'st_read_times' 和 'st_predict_times'
+                        "st_read_avg_ms": _avg_ms(m.profiling_data.get('st_read_times', [])),
+                        "st_predict_wall_avg_ms": _avg_ms(m.profiling_data.get('st_predict_times', []))
                     }
                     
                     # 2. 存儲宏觀數據
                     profiling_details[f"channel_{m.channel_id}"] = macro_data
                     
                     # 3. 併入微觀理論數據 (Task A)
-                    # (micro_profiling 是從 benchmark_video_fixed_channels 傳入的)
                     profiling_details[f"channel_{m.channel_id}"].update(micro_profiling)
-
         
         # 將剖析數據加入到 performance_metrics 中
         if profiling_details:
             report["performance_metrics"]["profiling_details"] = profiling_details
         
-        # 硬體分析
+        # ... ( hardware_analysis 和 optimization_recommendations 部分都一樣) ...
+        # (硬體分析和優化建議邏輯不變)
         report["hardware_analysis"] = {
             "hardware_specs": self.hardware_specs,
             "channel_allocation": {
@@ -1204,33 +1163,16 @@ class FixedChannelBenchmark:
                 "is_ideal_config": config['actual_models'] >= config['requested_channels']
             },
             "memory_utilization": {
-                # "estimated_model_memory": 0, # 已棄用
                 "total_used_memory": config.get('load_info', {}).get('total_memory_usage', 0),
                 "available_memory": self.hardware_specs.get('gpu_memory_gb', 0) if self.device != 'cpu' else self.hardware_specs.get('total_memory_gb', 0)
             }
         }
         
-        # 優化建議
         recommendations = []
-        
         if config['actual_models'] >= config['requested_channels']:
             recommendations.append("✅ 理想配置：每個Channel都有專屬模型")
-            recommendations.append("✅ 性能最佳：無模型共享，無資源競爭")
         else:
             recommendations.append(f"⚠️ 模型共享：每個模型處理 {config['channels_per_model']:.1f} 個Channel")
-            recommendations.append(f"⚠️ 硬體限制：只能載入 {config['actual_models']}/{config['requested_channels']} 個模型")
-            
-            if config['requested_channels'] > 8:
-                recommendations.append("💡 原因：GPU運算瓶頸，避免過多模型同時運行")
-                recommendations.append("💡 建議：使用更小的模型 (yolov8n) 以載入更多實例")
-                recommendations.append("💡 建議：考慮使用批次處理來提升效率")
-            else:
-                if self.device != 'cpu':
-                    recommendations.append("💡 建議：升級GPU記憶體以支援更多模型")
-                    recommendations.append("💡 建議：使用更小的模型 (yolov8n) 以載入更多實例")
-                else:
-                    recommendations.append("💡 建議：增加系統記憶體或使用GPU加速")
-        
         report["optimization_recommendations"] = recommendations
         
         return report
