@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
-固定Channel數量的多模型並行基準測試工具
-用戶設定的Channel數不會改變，用可載入的模型數量來處理所有Channel
+使用靜態批次處理 (Static Batching) 的計算機視覺基準測試工具。
+此腳本通過將多個視頻流（Channels）組合成一個批次，
+使用單一模型實例進行推論，以評估吞吐量和延遲。
 """
 import argparse
 import os
@@ -170,15 +171,15 @@ class ResourceMonitor(threading.Thread):
 
 
 class FixedChannelBenchmark:
-    """固定Channel數量的多模型並行基準測試主類"""
+    """使用靜態批次處理的基準測試主類"""
     
-    def __init__(self, 
+    def __init__(self,
                  model_name: str = 'yolov8n.pt',
                  device: str = 'auto',
                  img_size: int = 640,
                  conf_threshold: float = 0.25,
                  iou_threshold: float = 0.5):
-        """初始化固定Channel基準測試器"""
+        """初始化靜態批次基準測試器"""
         self.model_name = model_name
         self.device = self._parse_device(device)
         self.img_size = img_size
@@ -188,7 +189,7 @@ class FixedChannelBenchmark:
         # 硬體規格檢測
         self.hardware_specs = self._detect_hardware_specs()
         
-        print(f"🚀 固定Channel多模型並行基準測試器初始化完成")
+        print(f"🚀 靜態批次基準測試器初始化完成")
         print(f"   • 模型: {model_name}")
         print(f"   • 設備: {self.device}")
         print(f"   • 圖片尺寸: {img_size}x{img_size}")
@@ -357,19 +358,21 @@ class FixedChannelBenchmark:
             print(f"❌ 模型實例 {model_id} 載入失敗: {e}")
             raise
 
-    def predict_single_frame(self, model: YOLO, frame: np.ndarray) -> Tuple[List[Dict], float]:
+    def predict_single_frame(self, model: YOLO, frame: np.ndarray) -> Tuple[List[Dict], float, float, float]:
         """
-        [宏觀測試用] 對單一幀進行預測，只返回檢測結果和總牆上時間（秒）。
-        Profiler 已被移除，以確保執行緒安全。
+        [宏觀測試用] 對單一幀進行預測，並將推論與後處理分開計時。
         
         返回:
             detections (List[Dict]): 檢測結果
             processing_time_s (float): 總牆上時間 (秒)
+            t_infer_s (float): 純推論 (model.predict) 時間 (秒)
+            t_post_s (float): 純後處理 (cpu copy) 時間 (秒)
         """
         t_wall_start = perf_counter()
 
         try:
-            # 1. 執行推論 (不使用 profiler)
+            # --- 1. 執行推論 (單獨計時) ---
+            t_infer_start = perf_counter()
             with torch.inference_mode():
                 results = model.predict(
                     source=frame,
@@ -379,12 +382,16 @@ class FixedChannelBenchmark:
                     verbose=False,
                     save=False
                 )
+            t_infer_end = perf_counter()
+            # --- 推論計時結束 ---
 
-            # 2. CPU 後處理
+            # --- 2. CPU 後處理 (單獨計時) ---
+            t_post_start = perf_counter()
             detections = []
             if results:
                 for r in results:
                     if r.boxes is not None:
+                        # 這裡 .cpu().numpy() 會強制 GPU 同步
                         boxes = r.boxes.xyxy.cpu().numpy()
                         confidences = r.boxes.conf.cpu().numpy()
                         classes = r.boxes.cls.cpu().numpy().astype(int)
@@ -397,15 +404,23 @@ class FixedChannelBenchmark:
                                 'class_name': r.names[int(classes[i])]
                             }
                             detections.append(detection)
+            t_post_end = perf_counter()
+            # --- 後處理計時結束 ---
 
             t_wall_end = perf_counter()
             processing_time_s = t_wall_end - t_wall_start
             
-            return detections, processing_time_s
+            # 計算新的指標
+            t_infer_s = t_infer_end - t_infer_start
+            t_post_s = t_post_end - t_post_start
+            
+            # 返回 4 個值
+            return detections, processing_time_s, t_infer_s, t_post_s
             
         except Exception as e:
             print(f"⚠️ 預測錯誤: {e}")
-            return [], 0.0
+            # 確保返回 4 個值
+            return [], 0.0, 0.0, 0.0
 
     def _profile_model_once(self, model: YOLO) -> Dict[str, float]:
         """
@@ -496,20 +511,26 @@ class FixedChannelBenchmark:
             print(f"   ❌ [微觀剖析] 失敗: {e}")
             return {}
 
-    def benchmark_video_fixed_channels(self, 
-                                      video_path: str, 
+    def benchmark_video_fixed_channels(self,
+                                      video_path: str,
                                       duration_seconds: int = 60,
                                       requested_channels: int = 1,
-                                      fixed_models: Optional[int] = None,
-                                      output_file: Optional[str] = None) -> Dict[str, Any]:
-        """固定Channel數量的多模型並行視頻基準測試"""
+                                      output_file: Optional[str] = None,
+                                      save_preview: bool = False) -> Dict[str, Any]:
+        """
+        使用靜態批次處理執行視頻基準測試。
+        `requested_channels` 參數將被用作批次大小 (batch size)。
+        """
         # 記錄測試開始時間
         test_start_time = time.time()
         
-        print(f"🎬 開始固定Channel多模型並行視頻基準測試")
+        print(f"🎬 開始靜態批次基準測試")
         print(f"   • 視頻: {video_path}")
         print(f"   • 持續時間: {duration_seconds}秒")
-        print(f"   • 請求Channel數: {requested_channels}")
+        print(f"   • 批次大小 (Channels): {requested_channels}")
+
+        # 在批次模式下，我們總是使用 1 個模型
+        max_models = 1
         
         # 驗證視頻文件
         if not os.path.isfile(video_path):
@@ -519,56 +540,26 @@ class FixedChannelBenchmark:
         video_info = self._get_video_info(video_path)
         print(f"📹 視頻信息: {video_info['width']}x{video_info['height']}, {video_info['fps']:.2f} FPS")
         
-        # 確定要載入的模型數量
-        if fixed_models is not None:
-            # 使用用戶指定的固定模型數量
-            max_models = fixed_models
-            print(f"\n🔧 使用固定模型數量: {max_models}")
-            print(f"   • 跳過自動計算，直接載入 {max_models} 個模型")
-            
-            # 測試載入指定數量的模型
-            success, load_times, memory_usage = self._test_model_loading(max_models)
-            if not success:
-                print(f"❌ 無法載入 {max_models} 個模型，測試終止")
-                return {}
-            
-            load_info = {
-                'load_times': load_times,
-                'memory_usage': memory_usage,
-                'avg_load_time': float(np.mean(load_times)) if load_times else 0.0,
-                'avg_memory_usage': float(np.mean(memory_usage)) if memory_usage else 0.0,
-                'total_memory_usage': float(np.sum(memory_usage)) if memory_usage else 0.0
-            }
-        else:
-            # 使用自動計算的模型數量
-            max_models, load_info = self._find_max_loadable_models(requested_channels)
-        
-        if max_models == 0:
-            print("❌ 無法載入任何模型，測試終止")
+        # 測試載入 1 個模型
+        success, load_times, memory_usage = self._test_model_loading(max_models)
+        if not success:
+            print(f"❌ 無法載入模型，測試終止")
             return {}
         
-        print(f"\n🎯 模型分配策略:")
-        print(f"   • 請求Channel數: {requested_channels}")
+        load_info = {
+            'load_times': load_times,
+            'memory_usage': memory_usage,
+            'avg_load_time': float(np.mean(load_times)) if load_times else 0.0,
+            'avg_memory_usage': float(np.mean(memory_usage)) if memory_usage else 0.0,
+            'total_memory_usage': float(np.sum(memory_usage)) if memory_usage else 0.0
+        }
+
+        print(f"\n🎯 執行策略:")
+        print(f"   • 批次大小: {requested_channels}")
         print(f"   • 載入模型數: {max_models}")
+        print(f"   • 配置方式: 靜態批次處理")
         
-        if fixed_models is not None:
-            print(f"   • 配置方式: 用戶指定固定模型數量")
-        else:
-            print(f"   • 配置方式: 自動計算模型數量")
-        
-        if max_models >= requested_channels:
-            print(f"   • 分配策略: 每個Channel都有專屬模型 (理想配置)")
-            channels_per_model = 1.0
-        else:
-            print(f"   • 分配策略: {max_models}個模型處理{requested_channels}個Channel")
-            channels_per_model = requested_channels / max_models
-            print(f"   • 每個模型處理: {channels_per_model:.1f}個Channel")
-            
-            # 解釋為什麼限制模型數量
-            if fixed_models is not None:
-                print(f"   • 原因: 用戶指定固定模型數量")
-            elif requested_channels > 8:
-                print(f"   • 原因: 避免GPU運算瓶頸，確保最佳性能")
+        channels_per_model = requested_channels / max_models
         
         # 初始化Channel指標收集器
         channel_metrics = [FixedChannelMetric(i) for i in range(requested_channels)]
@@ -618,21 +609,32 @@ class FixedChannelBenchmark:
         resource_monitor = ResourceMonitor()
         resource_monitor.start()
 
-        # 啟動Channel工作線程
+        # --- 👇 簡化為僅啟動批次工作線程的邏輯 --- 👇
         threads = []
         stop_ts = time.time() + duration_seconds
         
-        print(f"\n🚀 啟動 {requested_channels} 個Channel工作線程...")
+        print(f"🚀 啟動 1 個批次工作線程 (Batch Size = {requested_channels}) ...")
         
-        for channel_id in range(requested_channels):
-            model_id = channel_to_model[channel_id]
-            thread = threading.Thread(
-                target=self._fixed_channel_worker_thread,
-                args=(channel_id, model_id, video_path, stop_ts, channel_metrics[channel_id], models[model_id]),
-                daemon=True
-            )
-            thread.start()
-            threads.append(thread)
+        # 1. 我們只使用 1 個模型
+        batch_model = models[0]
+        
+        # 2. 我們只啟動 1 個工作線程
+        # 這個線程將處理 *所有* channels
+        batch_thread = threading.Thread(
+            target=self._fixed_channel_worker_batch,
+            args=(
+                video_path,
+                stop_ts,
+                channel_metrics, # 傳遞 *所有* metrics
+                batch_model,
+                requested_channels, # 告訴它批次大小 (N)
+                save_preview # 傳遞預覽標誌
+            ),
+            daemon=True
+        )
+        batch_thread.start()
+        threads = [batch_thread] # 只有一個線程
+        # --- 👆 替換結束 --- 👆
         
         print("✅ 開始固定Channel性能監控\n")
         
@@ -658,15 +660,14 @@ class FixedChannelBenchmark:
         test_end_time = time.time()
         total_execution_time = test_end_time - test_start_time
         
-        # --- 👇 這裡是修正點 #1 (失誤 #1) --- 👇
-        # 生成報告 (補上完整的 config 字典)
+        # --- 👇 修改 config 字典 --- 👇
         config = {
             'model': self.model_name,
             'video': video_path,
             'requested_channels': requested_channels,
             'actual_models': max_models,
             'channels_per_model': channels_per_model,
-            'fixed_models': fixed_models,
+            'fixed_models': 1, # 在此模式下，模型數始終為1
             'img_size': self.img_size,
             'video_resolution': f"{video_info['width']}x{video_info['height']}",
             'video_fps': video_info['fps'],
@@ -676,11 +677,15 @@ class FixedChannelBenchmark:
             'device': self.device,
             'model_load_time': sum(model_load_times),
             'total_execution_time': total_execution_time,
-            'architecture': 'fixed_channel_multi_model_parallel',
+            
+            # --- 替換 'architecture' ---
+            'architecture': 'static_batching',
+            
             'hardware_specs': self.hardware_specs,
             'load_info': load_info,
             'channel_allocation': channel_to_model
         }
+        # --- 👆 ---
         
         # 將微觀剖析結果 (micro_profiling_results) 傳遞給報告生成器
         report = self._generate_fixed_channel_report(
@@ -707,198 +712,158 @@ class FixedChannelBenchmark:
 
     def run_auto_optimization(self, args: argparse.Namespace) -> Dict[str, Any]:
         """
-        自動優化主函數，迭代不同的模型數量配置，執行測試，並生成最佳化報告。
+        自動優化主函數，迭代不同的批次大小（Channels），以找到最佳吞吐量。
+        (已修改為測試 2 的冪次方)
         """
-        # 記錄優化測試開始時間
         optimization_start_time = time.time()
-        
-        print(f"🚀 開始自動優化模型數量測試")
+        print(f"🚀 開始自動優化批次大小測試")
         print(f"   • 視頻: {args.video}")
         print(f"   • 持續時間: {args.seconds}秒")
-        print(f"   • 請求Channel數: {args.channels}")
-        
-        # 獲取視頻信息
+        print(f"   • 最大測試批次大小: {args.channels}")
         video_info = self._get_video_info(args.video)
         print(f"📹 視頻信息: {video_info['width']}x{video_info['height']}, {video_info['fps']:.2f} FPS")
-        
-        # 創建唯一的報告目錄
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         model_name_base = os.path.splitext(os.path.basename(self.model_name))[0]
-        
-        # 檢查是否有指定的 output_dir
         output_dir = getattr(args, 'output_dir', 'reports')
-        
         report_dir_name = f"cv_optimization_{model_name_base}_{args.channels}ch_{timestamp}"
         report_dir = os.path.join(output_dir, report_dir_name)
         os.makedirs(report_dir, exist_ok=True)
         print(f"📂 報告將儲存於: {report_dir}")
         
-        # 迭代測試邏輯
         test_results = []
-        test_configs = list(range(1, args.channels + 1))
         
-        print(f"\n🔍 將執行 {len(test_configs)} 次測試，模型數量從 1 到 {args.channels}")
+        # 新邏輯：只測試 2 的冪次方，以找到最佳效能點
+        test_configs_set = set()
+        batch_size = 1
+        while batch_size <= args.channels:
+            test_configs_set.add(batch_size)
+            batch_size *= 2
         
-        for i, model_count in enumerate(test_configs, 1):
+        # 確保「最大值」 (N) 總是被測試到，以防它是最佳解
+        test_configs_set.add(args.channels)
+        
+        test_configs = sorted(list(test_configs_set))
+
+        print(f"\n🔍 [優化] 將執行 {len(test_configs)} 次測試，測試的批次大小為: {test_configs}")
+        
+        for i, batch_size in enumerate(test_configs, 1):
             print(f"\n{'='*60}")
-            print(f"🧪 測試 {i}/{len(test_configs)}: 使用 {model_count} 個模型")
+            print(f"🧪 測試 {i}/{len(test_configs)}: 批次大小 = {batch_size}")
             print(f"{'='*60}")
             
             try:
-                # 為中間報告生成檔案路徑
-                intermediate_report_name = f"benchmark_{model_count}_models.json"
+                intermediate_report_name = f"benchmark_batch_{batch_size}.json"
                 intermediate_output_file = os.path.join(report_dir, intermediate_report_name)
                 
-                # 執行單次測試
                 result = self.benchmark_video_fixed_channels(
                     video_path=args.video,
                     duration_seconds=args.seconds,
-                    requested_channels=args.channels,
-                    fixed_models=model_count,
-                    output_file=intermediate_output_file
+                    requested_channels=batch_size,
+                    output_file=intermediate_output_file,
+                    save_preview=getattr(args, 'save_preview', False)
                 )
                 
                 if result and 'performance_metrics' in result:
                     perf = result['performance_metrics']
-                    config = result['configuration']
-                    resource_usage = perf.get('resource_usage', {})
                     
-                    # 提取關鍵指標
-                    avg_fps = perf['fps']['average']
-                    total_fps = perf['fps']['total']
-                    avg_latency = perf['latency_ms']['average']
-                    channels_per_model = config['channels_per_model']
-                    
-                    # 計算效率分數
+                    # 根據新的 JSON 結構提取關鍵指標
+                    avg_fps = perf.get('fps', {}).get('average')
+                    total_fps = perf.get('fps', {}).get('total')
+                    avg_latency = perf.get('latency_ms', {}).get('average')
+
+                    if avg_fps is None or total_fps is None or avg_latency is None:
+                        print(f"❌ 測試結果缺少關鍵指標: 批次大小 = {batch_size}")
+                        continue
+
+                    model_count = 1
+                    channels_per_model = batch_size / model_count
+
                     efficiency_score = self._calculate_efficiency_score(
                         avg_fps, total_fps, avg_latency,
-                        args.channels, model_count, channels_per_model
+                        batch_size, model_count, channels_per_model
                     )
                     
                     summary = {
-                        'model_count': model_count,
+                        'batch_size': batch_size,
                         'avg_fps': avg_fps,
                         'total_fps': total_fps,
                         'avg_latency': avg_latency,
-                        'channels_per_model': channels_per_model,
                         'efficiency_score': efficiency_score,
-                        'is_ideal_config': model_count >= args.channels,
-                        'resource_usage': resource_usage,
+                        'resource_usage': perf.get('resource_usage', {}),
                         'report_file': intermediate_report_name
                     }
                     
-                    # 如果存在 profiling_details，則將其複製到摘要中
-                    if 'profiling_details' in perf:
-                        summary['profiling_details'] = perf['profiling_details']
+                    if 'profiling_details' in result:
+                        summary['profiling_summary'] = result['profiling_details']
                     
                     test_results.append(summary)
                     
-                    print(f"✅ 測試完成: {model_count}個模型")
+                    print(f"✅ 測試完成: 批次大小 = {batch_size}")
                     print(f"   • 平均FPS: {avg_fps:.2f}")
-                    print(f"   • 總FPS: {total_fps:.2f}")
+                    print(f"   • 總FPS (吞吐量): {total_fps:.2f}")
                     print(f"   • 平均延遲: {avg_latency:.2f}ms")
                     print(f"   • 效率分數: {efficiency_score:.2f}")
                     
                 else:
-                    print(f"❌ 測試失敗: {model_count}個模型")
+                    print(f"❌ 測試失敗: 批次大小 = {batch_size}")
                     
             except Exception as e:
-                print(f"❌ 測試錯誤: {model_count}個模型 - {e}")
+                print(f"❌ 測試錯誤: 批次大小 = {batch_size} - {e}")
                 continue
         
-        # 分析結果並找到最佳配置
         if not test_results:
             print("❌ 所有測試都失敗了，無法生成優化報告")
             return {}
         
-        best_config = self._find_best_configuration(test_results, args.channels)
+        best_config = max(test_results, key=lambda x: x['total_fps'])
         
-        # 生成優化報告
         optimization_report = self._generate_optimization_report(
             test_results, best_config, video_info, args.channels
         )
         
-        # 顯示優化結果
         self._print_optimization_report(optimization_report)
         
-        # 將最終優化報告儲存到專屬資料夾中
         final_report_name = "optimization_report.json"
         final_output_file = os.path.join(report_dir, final_report_name)
         
-        # 保存報告
         self._save_report(optimization_report, final_output_file)
         print(f"\n📄 優化報告已保存至: {final_output_file}")
         
         return optimization_report
 
-    def _calculate_efficiency_score(self, avg_fps: float, total_fps: float, 
-                                  avg_latency: float, requested_channels: int, 
+    def _calculate_efficiency_score(self, avg_fps: float, total_fps: float,
+                                  avg_latency: float, batch_size: int,
                                   model_count: int, channels_per_model: float) -> float:
-        """計算效率分數"""
+        """計算效率分數（簡化版，專注於吞吐量和延遲）"""
         # 權重配置
-        fps_weight = 0.4      # FPS權重
-        latency_weight = 0.3  # 延遲權重
-        efficiency_weight = 0.3  # 效率權重
+        throughput_weight = 0.6  # 總吞吐量權重
+        latency_weight = 0.4   # 延遲權重
         
-        # FPS分數 (0-100)
-        fps_score = min(100, (avg_fps / 30) * 100)  # 以30 FPS為滿分
+        # 吞吐量分數 (0-100)，以一個參考值（如 100 FPS）為基準
+        throughput_score = min(100, (total_fps / 100) * 100)
         
-        # 延遲分數 (0-100，延遲越低分數越高)
+        # 延遲分數 (0-100)，延遲越低分數越高
         latency_score = max(0, 100 - (avg_latency / 100) * 100)  # 以100ms為基準
         
-        # 效率分數 (0-100，模型利用率越高分數越高)
-        if channels_per_model >= 1.0:
-            efficiency_score = 100  # 理想配置
-        else:
-            efficiency_score = channels_per_model * 100  # 共享模型效率
-        
         # 計算總分
-        total_score = (fps_score * fps_weight + 
-                      latency_score * latency_weight + 
-                      efficiency_score * efficiency_weight)
+        total_score = (throughput_score * throughput_weight +
+                       latency_score * latency_weight)
         
         return total_score
 
-    def _find_best_configuration(self, results: List[Dict], requested_channels: int) -> Dict:
-        """找到最佳配置"""
-        if not results:
-            return {}
-        
-        # 按效率分數排序
-        sorted_results = sorted(results, key=lambda x: x['efficiency_score'], reverse=True)
-        
-        # 找到最佳配置
-        best = sorted_results[0]
-        
-        # 分析配置類型
-        if best['is_ideal_config']:
-            config_type = "理想配置"
-            recommendation = "每個Channel都有專屬模型，性能最佳"
-        elif best['channels_per_model'] >= 2.0:
-            config_type = "高效共享"
-            recommendation = "模型共享效率高，適合高吞吐量應用"
-        else:
-            config_type = "平衡配置"
-            recommendation = "FPS和延遲的平衡點，適合大多數應用"
-        
-        best['config_type'] = config_type
-        best['recommendation'] = recommendation
-        
-        return best
-
-    def _generate_optimization_report(self, results: List[Dict], best_config: Dict, 
-                                    video_info: Dict, requested_channels: int) -> Dict:
+    def _generate_optimization_report(self, results: List[Dict], best_config: Dict,
+                                    video_info: Dict, max_batch_size: int) -> Dict:
         """生成優化報告"""
         report = {
             "timestamp": datetime.now().isoformat(),
             "sdk_info": {
-                "name": "Auto-Optimization Multi-Model Benchmark",
-                "version": "1.0.0",
+                "name": "Auto-Optimization Batch Benchmark",
+                "version": "1.1.0",
                 "framework": "PyTorch + Ultralytics YOLO"
             },
             "test_configuration": {
-                "video": video_info,
-                "requested_channels": requested_channels,
+                "video": video_info.get('path', 'N/A'),
+                "max_batch_size_tested": max_batch_size,
                 "model": self.model_name,
                 "device": self.device,
                 "img_size": self.img_size
@@ -907,13 +872,10 @@ class FixedChannelBenchmark:
             "best_configuration": best_config,
             "optimization_summary": {
                 "total_tests": len(results),
-                "best_model_count": best_config.get('model_count', 0),
-                "best_avg_fps": best_config.get('avg_fps', 0),
+                "best_batch_size": best_config.get('batch_size', 0),
                 "best_total_fps": best_config.get('total_fps', 0),
-                "best_latency": best_config.get('avg_latency', 0),
-                "efficiency_score": best_config.get('efficiency_score', 0),
-                "config_type": best_config.get('config_type', ''),
-                "recommendation": best_config.get('recommendation', '')
+                "latency_at_best_fps": best_config.get('avg_latency', 0),
+                "recommendation": f"為獲得最高吞吐量，建議使用批次大小為 {best_config.get('batch_size', 0)}。"
             }
         }
         
@@ -922,103 +884,214 @@ class FixedChannelBenchmark:
     def _print_optimization_report(self, report: Dict):
         """顯示優化報告"""
         print(f"\n{'='*80}")
-        print(f"🎯 自動優化結果報告")
+        print(f"🎯 自動優化批次大小結果報告")
         print(f"{'='*80}")
         
         # 最佳配置
-        best = report['best_configuration']
         summary = report['optimization_summary']
         test_config = report['test_configuration']
         
-        print(f"\n🏆 最佳配置:")
-        print(f"  • 模型數量: {summary['best_model_count']}")
-        print(f"  • 配置類型: {summary['config_type']}")
-        print(f"  • 平均FPS: {summary['best_avg_fps']:.2f}")
-        print(f"  • 總FPS: {summary['best_total_fps']:.2f}")
-        print(f"  • 平均延遲: {summary['best_latency']:.2f}ms")
-        print(f"  • 效率分數: {summary['efficiency_score']:.2f}/100")
+        print(f"\n🏆 最佳配置 (基於最高總吞吐量):")
+        print(f"  • 最佳批次大小: {summary['best_batch_size']}")
+        print(f"  • 最高總FPS (吞吐量): {summary['best_total_fps']:.2f}")
+        print(f"  • 在此配置下的平均延遲: {summary['latency_at_best_fps']:.2f}ms")
         print(f"  • 建議: {summary['recommendation']}")
         
         # 所有測試結果
         print(f"\n📊 所有測試結果:")
-        print(f"{'模型數':<8} {'平均FPS':<10} {'總FPS':<10} {'延遲(ms)':<12} {'Avg CPU(%)':<12} {'Avg GPU(%)':<12} {'效率分數':<10} {'配置類型'}")
-        print(f"{'-'*95}")
+        print(f"{'批次大小':<10} {'總FPS':<12} {'平均延遲(ms)':<15} {'Avg CPU(%)':<12} {'Avg GPU(%)':<12}")
+        print(f"{'-'*75}")
         
         for result in report['test_results']:
-            config_type = "理想" if result['is_ideal_config'] else "共享"
             resource_usage = result.get('resource_usage', {})
             avg_cpu = resource_usage.get('cpu', {}).get('average', 0.0)
             avg_gpu = resource_usage.get('gpu', {}).get('average', 0.0)
             
-            print(f"{result['model_count']:<8} {result['avg_fps']:<10.2f} {result['total_fps']:<10.2f} "
-                  f"{result['avg_latency']:<12.2f} {avg_cpu:<12.1f} {avg_gpu:<12.1f} "
-                  f"{result['efficiency_score']:<10.2f} {config_type}")
+            print(f"{result['batch_size']:<10} {result['total_fps']:<12.2f} {result['avg_latency']:<15.2f} "
+                  f"{avg_cpu:<12.1f} {avg_gpu:<12.1f}")
         
         # 使用建議
         print(f"\n💡 使用建議:")
-        print(f"  • 最佳指令: python fixed_channel_benchmark.py --video {test_config['video']['width']}x{test_config['video']['height']} --model {self.model_name} -n {test_config['requested_channels']} -m {summary['best_model_count']} -t 30")
-        print(f"  • 預期性能: 每個Channel約{summary['best_avg_fps']:.1f} FPS")
-        print(f"  • 總吞吐量: {summary['best_total_fps']:.1f} frames/sec")
+        print(f"  • 最佳指令: python {os.path.basename(__file__)} --video {test_config['video']} --model {self.model_name} -n {summary['best_batch_size']} -t 60")
+        print(f"  • 預期總吞吐量: {summary['best_total_fps']:.1f} frames/sec")
 
-    def _fixed_channel_worker_thread(self,
-                                   channel_id: int,
-                                   model_id: int,
-                                   video_path: str,
-                                   stop_ts: float,
-                                   metric: FixedChannelMetric,
-                                   model: YOLO):
+    def _fixed_channel_worker_batch(self,
+                                  video_path: str,
+                                  stop_ts: float,
+                                  all_metrics: List[FixedChannelMetric],
+                                  model: YOLO,
+                                  batch_size: int,
+                                  save_preview: bool = False):
         """
-        [NEW] 固定Channel工作線程函數 (改回「單一執行緒」依序模式)
-        (已移除 生產者-消費者 架構)
+        [批次處理 (Batching) 工作者]
+        此單一線程工作者會：
+        1. 開啟 'batch_size' 個 video captures。
+        2. 從每個 capture 讀取 1 幀，組成一個 batch。
+        3. 一次性呼叫 model.predict(batch)。
+        4. 將結果分發回 'all_metrics' 列表。
         """
-        print(f"🔄 Channel {channel_id} (單一執行緒模式) 開始工作 (使用Model {model_id})")
+        print(f"🔄 批次工作者 [Batch size={batch_size}] 開始工作 (使用 Model 0)")
         
-        # 1. 初始化 (Init)
-        # 每個執行緒現在都開啟「自己 (じぶん)」的影片捕獲
-        cap = cv2.VideoCapture(video_path)
-        if not cap.isOpened():
-            print(f"[Channel {channel_id}] 無法打開視頻: {video_path}")
-            return
-            
-        # 2. 準備收集新的「剖析 (Profiling)」數據
+        # 1. 為 'N' 個 Channel 開啟 'N' 個 video captures
+        caps = []
+        for i in range(batch_size):
+            cap = cv2.VideoCapture(video_path)
+            if not cap.isOpened():
+                print(f"[Batch Worker] ❌ 無法打開 Channel {i} 的視頻")
+                return
+            caps.append(cap)
+        
+        # 準備收集剖析數據
         read_times = []
-        predict_times = []
+        batch_predict_wall_times = []
+        batch_predict_infer_times = []
+        batch_predict_post_times = []
         
+        frame_batch = [None] * batch_size # 預分配列表
+        valid_frame_indices = []
+
+        # --- 👇 [關鍵修改 1] 新增一個標記，確保我們只儲存第一批影像 ---
+        has_saved_preview_images = False
+        preview_dir = "preview_outputs" # 儲存影像的資料夾
+        if save_preview:
+            os.makedirs(preview_dir, exist_ok=True)
+        # --- 👆 ---
+
         try:
             while time.time() < stop_ts:
                 
-                # --- [A] 任務 A (I/O 任務) ---
+                # --- [A] 任務 A：建立批次 (Build Batch) ---
                 t_read_start = perf_counter()
-                ret, frame = cap.read()
+                
+                valid_frame_indices.clear()
+                
+                for i in range(batch_size):
+                    ret, frame = caps[i].read()
+                    if not ret:
+                        caps[i].set(cv2.CAP_PROP_POS_FRAMES, 0) # 重播
+                        ret, frame = caps[i].read()
+                    
+                    if ret:
+                        # --- 👇 [關鍵修改 2] 在送入模型前，先畫上 ID ---
+                        cv2.putText(
+                            frame,
+                            f"INPUT CHANNEL {i}",
+                            (50, 50), # 座標
+                            cv2.FONT_HERSHEY_SIMPLEX,
+                            2, # 字體大小
+                            (0, 0, 255), # 顏色 (BGR 紅色)
+                            3 # 線條粗細
+                        )
+                        # --- 👆 ---
+                        
+                        frame_batch[i] = frame # 放入批次 (已畫上文字的 Numpy array)
+                        valid_frame_indices.append(i)
+                    else:
+                        frame_batch[i] = None
+                    
                 t_read_end = perf_counter()
-                read_time_s = t_read_end - t_read_start
-                read_times.append(read_time_s)
-
-                if not ret:
-                    cap.set(cv2.CAP_PROP_POS_FRAMES, 0) # 影片重播 (Replay)
+                if not valid_frame_indices:
                     continue
                 
-                # --- [B] 任務 B (推論任務) ---
-                # (predict_single_frame 已經被我們簡化過了，只返回 2 個值)
-                detections, proc_time_s = self.predict_single_frame(model, frame)
-                predict_times.append(proc_time_s)
+                current_batch = [frame_batch[i] for i in valid_frame_indices]
+                read_times.append(t_read_end - t_read_start)
                 
-                # --- [C] 更新總指標 (Update Metrics) ---
-                # [關鍵！] 總延遲 (Total Latency) 現在是 A + B
-                total_loop_time_s = read_time_s + proc_time_s
-                metric.update(total_loop_time_s, len(detections))
+                # --- [B] 任務 B：推論批次 (Inference) ---
+                t_wall_start = perf_counter()
                 
+                t_infer_start = perf_counter()
+                with torch.inference_mode():
+                    results_list = model.predict(
+                        source=current_batch,
+                        conf=self.conf_threshold,
+                        iou=self.iou_threshold,
+                        verbose=False,
+                        save=False
+                    )
+                t_infer_end = perf_counter()
+
+                # --- 👇 [關鍵修改 3] 如果啟用，儲存我們畫好的預覽影像 ---
+                if save_preview and not has_saved_preview_images and results_list:
+                    print(f"📸 [Preview] 正在儲存第一個批次的 {len(results_list)} 張已標註影像...")
+                    
+                    for idx, result_obj in enumerate(results_list):
+                        output_frame_with_boxes = result_obj.plot()
+                        original_channel_id = valid_frame_indices[idx]
+                        save_path = os.path.join(preview_dir, f"output_channel_{original_channel_id}_(batch_index_{idx}).jpg")
+                        cv2.imwrite(save_path, output_frame_with_boxes)
+                        
+                    print(f"✅ [Preview] 影像已儲存至 {preview_dir} 資料夾")
+                    has_saved_preview_images = True # 標記為 true，之後不再儲存
+                # --- 👆 ---
+                
+                # 2. 後處理 (單獨計時)
+                t_post_start = perf_counter()
+                # 'results_list' 是一個包含 'batch_size' 個結果的列表
+                all_detections = []
+                for r in results_list: # 遍歷批次中的每個結果
+                    detections = []
+                    if r.boxes is not None:
+                        boxes = r.boxes.xyxy.cpu().numpy()
+                        confidences = r.boxes.conf.cpu().numpy()
+                        classes = r.boxes.cls.cpu().numpy().astype(int)
+                        
+                        for i in range(len(boxes)):
+                            det = {
+                                'class_id': int(classes[i]),
+                                'confidence': float(confidences[i]),
+                                'bbox': boxes[i].tolist(),
+                                'class_name': r.names[int(classes[i])]
+                            }
+                            detections.append(det)
+                    all_detections.append(detections)
+                t_post_end = perf_counter()
+                
+                t_wall_end = perf_counter()
+                
+                # --- [C] 儲存批次指標 ---
+                wall_s = t_wall_end - t_wall_start
+                infer_s = t_infer_end - t_infer_start
+                post_s = t_post_end - t_post_start
+                
+                batch_predict_wall_times.append(wall_s)
+                batch_predict_infer_times.append(infer_s)
+                batch_predict_post_times.append(post_s)
+                
+                # --- [D] 更新 *所有* Channel 的指標 ---
+                # 這是關鍵：我們使用「攤提 (Amortized)」延遲
+                amortized_latency_s = wall_s / len(valid_frame_indices) if valid_frame_indices else 0
+                
+                for i in valid_frame_indices:
+                    metric = all_metrics[i]
+                    # all_detections 的索引現在應該對應到 results_list 的索引
+                    # 而 results_list 的索引對應到 valid_frame_indices
+                    # 所以我們需要找到 valid_frame_indices 中 i 的位置
+                    try:
+                        result_idx = valid_frame_indices.index(i)
+                        num_dets = len(all_detections[result_idx])
+                        metric.update(amortized_latency_s, num_dets)
+                    except (ValueError, IndexError):
+                        # 如果發生錯誤，跳過此幀的更新
+                        pass
+                    
         except Exception as e:
-            print(f"[Channel {channel_id}] 工作線程錯誤: {e}")
+            print(f"[Batch Worker] 工作線程錯誤: {e}")
         finally:
-            cap.release()
+            for cap in caps:
+                cap.release()
             
-            # 回傳新的剖析數據 (Profiling Data)
-            # 我們不再 (no longer) 有 'put_q' 或 'get_q'
-            metric.profiling_data = {
-                'st_read_times': read_times,      # ST = Single-Thread
-                'st_predict_times': predict_times # ST = Single-Thread
+            # 回傳 *批次* 的剖析數據
+            # 我們只更新 channel_0 的 metric.profiling_data
+            # (這是一個簡化，因為所有 channel 共享這個數據)
+            batch_profiling_data = {
+                'batch_read_total_times': read_times, # 這是 N 幀的總時間
+                'batch_predict_wall_times': batch_predict_wall_times,
+                'batch_predict_infer_times': batch_predict_infer_times,
+                'batch_predict_post_times': batch_predict_post_times,
+                'batch_size': batch_size
             }
+            if all_metrics:
+                all_metrics[0].profiling_data = batch_profiling_data
 
     def _get_video_info(self, video_path: str) -> Dict[str, Any]:
         """獲取視頻信息"""
@@ -1077,8 +1150,8 @@ class FixedChannelBenchmark:
             "timestamp": datetime.now().isoformat(),
             # ... (sdk_info, configuration, summary 內容不變) ...
             "sdk_info": {
-                "name": "Fixed Channel Multi-Model Parallel Benchmark",
-                "version": "1.0.0",
+                "name": "Static Batching Benchmark",
+                "version": "1.1.0",
                 "framework": "PyTorch + Ultralytics YOLO"
             },
             "configuration": config,
@@ -1106,46 +1179,53 @@ class FixedChannelBenchmark:
                     "average": float(np.mean(fps_values)) if fps_values else 0.0,
                     "min": float(np.min(fps_values)) if fps_values else 0.0,
                     "max": float(np.max(fps_values)) if fps_values else 0.0,
-                    "per_channel": fps_values,
-                    "total": float(np.sum(fps_values)) if fps_values else 0.0
+                    "total": float(np.sum(throughput_values)) if throughput_values else 0.0
                 },
                 "latency_ms": {
                     "average": float(np.mean(latency_values)) if latency_values else 0.0,
                     "min": float(np.min(latency_values)) if latency_values else 0.0,
-                    "max": float(np.max(latency_values)) if latency_values else 0.0,
-                    "per_channel": latency_values
+                    "max": float(np.max(latency_values)) if latency_values else 0.0
                 },
                 "throughput": {
-                    "total": float(np.sum(throughput_values)) if throughput_values else 0.0,
-                    "per_channel": throughput_values
+                    "total": float(np.sum(throughput_values)) if throughput_values else 0.0
                 },
                 "resource_usage": resource_stats
             }
 
-        # --- 👇 這裡是修改重點 (しゅうせい) --- 👇
+        # --- 👇 簡化為僅處理批次模式的「微觀性能剖析」邏輯 --- 👇
         # 微觀性能剖析 (Profiling)
         profiling_details = {}
-        if metrics:
-            for m in metrics:
-                if m.profiling_data:
-                    def _avg_ms(data, key=None):
-                        if not data:
-                            return 0.0
-                        values = [d.get(key, 0) for d in data] if key else data
-                        return (sum(values) / len(values)) * 1000 if values else 0.0
-                    
-                    # 1. 獲取 [NEW] 單一執行緒 (ST) 實測數據
-                    macro_data = {
-                        # 我們現在讀取 'st_read_times' 和 'st_predict_times'
-                        "st_read_avg_ms": _avg_ms(m.profiling_data.get('st_read_times', [])),
-                        "st_predict_wall_avg_ms": _avg_ms(m.profiling_data.get('st_predict_times', []))
-                    }
-                    
-                    # 2. 存儲宏觀數據
-                    profiling_details[f"channel_{m.channel_id}"] = macro_data
-                    
-                    # 3. 併入微觀理論數據 (Task A)
-                    profiling_details[f"channel_{m.channel_id}"].update(micro_profiling)
+        if metrics and metrics[0].profiling_data and 'batch_size' in metrics[0].profiling_data:
+            def _avg_ms(data, key=None):
+                if not data:
+                    return 0.0
+                values = [d.get(key, 0) for d in data] if key else data
+                return (sum(values) / len(values)) * 1000 if values else 0.0
+
+            # --- 批次模式報告 ---
+            p_data = metrics[0].profiling_data
+            batch_size = p_data.get('batch_size', 1)
+            
+            # 獲取總批次時間
+            batch_wall_ms = _avg_ms(p_data.get('batch_predict_wall_times', []))
+            
+            # 計算 *攤提* 時間
+            amortized_wall_ms = batch_wall_ms / batch_size if batch_size > 0 else 0
+            
+            # 建立單一的 profiling 物件
+            macro_data = {
+                "batch_size": batch_size,
+                "batch_read_total_avg_ms": _avg_ms(p_data.get('batch_read_total_times', [])),
+                "batch_predict_wall_avg_ms": batch_wall_ms,
+                "batch_predict_infer_avg_ms": _avg_ms(p_data.get('batch_predict_infer_times', [])),
+                "batch_predict_post_avg_ms": _avg_ms(p_data.get('batch_predict_post_times', [])),
+                "amortized_latency_per_frame_ms": amortized_wall_ms
+            }
+            
+            # 合併宏觀實測數據和微觀理論數據
+            profiling_details = {**macro_data, **micro_profiling}
+
+        # --- 👆 替換結束 --- 👆
         
         # 將剖析數據加入到 performance_metrics 中
         if profiling_details:
@@ -1169,10 +1249,7 @@ class FixedChannelBenchmark:
         }
         
         recommendations = []
-        if config['actual_models'] >= config['requested_channels']:
-            recommendations.append("✅ 理想配置：每個Channel都有專屬模型")
-        else:
-            recommendations.append(f"⚠️ 模型共享：每個模型處理 {config['channels_per_model']:.1f} 個Channel")
+        recommendations.append(f"批次大小為 {config['requested_channels']}，使用單一模型進行處理。")
         report["optimization_recommendations"] = recommendations
         
         return report
@@ -1188,11 +1265,8 @@ class FixedChannelBenchmark:
         print(f"\n📊 測試配置:")
         print(f"  • 模型: {config['model']}")
         print(f"  • 視頻: {config['video']}")
-        print(f"  • 請求Channel數: {config['requested_channels']}")
+        print(f"  • 批次大小 (Channels): {config['requested_channels']}")
         print(f"  • 實際模型數: {config['actual_models']}")
-        print(f"  • 每模型處理Channel數: {config['channels_per_model']:.1f}")
-        if config.get('fixed_models') is not None:
-            print(f"  • 固定模型數量: {config['fixed_models']} (用戶指定)")
         print(f"  • 模型載入時間: {config['model_load_time']:.3f}秒")
         print(f"  • 總執行時間: {config['total_execution_time']:.3f}秒")
         print(f"  • 模型輸入尺寸: {config['img_size']}x{config['img_size']}")
@@ -1241,14 +1315,9 @@ class FixedChannelBenchmark:
         # 硬體分析
         hw_analysis = report["hardware_analysis"]
         print(f"\n🔍 硬體分析:")
-        print(f"  • Channel分配: {hw_analysis['channel_allocation']['requested_channels']} → {hw_analysis['channel_allocation']['actual_models']} 模型")
-        print(f"  • 每模型處理: {hw_analysis['channel_allocation']['channels_per_model']:.1f} 個Channel")
-        print(f"  • 分配效率: {hw_analysis['channel_allocation']['allocation_efficiency']:.1f}%")
-        
-        if hw_analysis['channel_allocation']['is_ideal_config']:
-            print(f"  • 配置狀態: ✅ 理想配置 (每個Channel都有專屬模型)")
-        else:
-            print(f"  • 配置狀態: ⚠️ 模型共享 (多個Channel共享模型)")
+        print(f"  • 執行模式: 靜態批次處理")
+        print(f"  • 批次大小: {hw_analysis['channel_allocation']['requested_channels']}")
+        print(f"  • 使用模型數: {hw_analysis['channel_allocation']['actual_models']}")
         
         # print(f"  • 估算模型記憶體: {hw_analysis['memory_utilization']['estimated_model_memory']:.1f} GB") # 已棄用
         print(f"  • 總使用記憶體: {hw_analysis['memory_utilization']['total_used_memory']:.1f} GB")
@@ -1260,15 +1329,6 @@ class FixedChannelBenchmark:
             for i, recommendation in enumerate(report["optimization_recommendations"], 1):
                 print(f"  {i}. {recommendation}")
         
-        # 效率分數計算說明
-        print(f"\n📊 效率分數計算說明:")
-        print(f"  效率分數是一個綜合評分系統 (總分100分)，用來評估不同模型配置的整體性能表現：")
-        print(f"  • FPS分數 (40%權重): 以30 FPS為滿分，計算公式: min(100, (平均FPS/30) × 100)")
-        print(f"  • 延遲分數 (30%權重): 以100ms為基準，延遲越低分數越高，計算公式: max(0, 100 - (平均延遲/100) × 100)")
-        print(f"  • 效率分數 (30%權重): 理想配置(每Channel專屬模型)為100分，共享模型為 channels_per_model × 100")
-        print(f"  • 總分計算: FPS分數×0.4 + 延遲分數×0.3 + 效率分數×0.3")
-        print(f"  • 分數意義: 0-30分(需優化) | 30-60分(可接受) | 60-80分(良好) | 80-100分(優秀)")
-        
         print("\n" + "="*80)
 
     def _save_report(self, report: Dict[str, Any], output_file: str):
@@ -1279,29 +1339,29 @@ class FixedChannelBenchmark:
 
 def main():
     """主函數"""
-    parser = argparse.ArgumentParser(description="固定Channel數量的多模型並行基準測試工具")
+    parser = argparse.ArgumentParser(description="使用靜態批次處理的計算機視覺基準測試工具。")
     parser.add_argument("--video", type=str, required=True, help="視頻文件路徑")
     parser.add_argument("--model", type=str, default="yolov8n.pt", help="YOLO 模型名稱或路徑")
-    parser.add_argument("-n", "--channels", type=int, default=4, help="固定的並行Channel數（不會改變）")
-    parser.add_argument("-m", "--models", type=int, help="固定載入的模型數量（覆蓋自動計算）")
-    parser.add_argument("--auto-optimize", action="store_true", help="自動測試從1到N個模型數量，找到最佳平衡點")
+    parser.add_argument("-n", "--channels", type=int, default=4, help="並行處理的Channel數。在單次測試中作為批次大小；在自動優化中作為最大測試批次大小。")
+    parser.add_argument("-m", "--models", type=int, help="[已棄用] 此參數將被忽略，模型數始終為1。")
+    parser.add_argument("--auto-optimize", action="store_true", help="自動測試從1到N的批次大小，以找到最佳吞吐量。")
+    
     parser.add_argument("-t", "--seconds", type=int, default=60, help="測試持續時間（秒）")
     parser.add_argument("--img-size", type=int, default=640, help="模型輸入尺寸")
     parser.add_argument("--conf", type=float, default=0.25, help="置信度閾值")
     parser.add_argument("--iou", type=float, default=0.5, help="IoU 閾值")
     parser.add_argument("--device", type=str, default="cuda", help="設備配置 (auto, cpu, cuda)")
     parser.add_argument("--output", type=str, help="輸出報告文件路徑 (單次測試) 或報告目錄 (自動優化)")
+    parser.add_argument("--save-preview", action="store_true", help="Save the first batch of processed frames with bounding boxes for visual verification.")
     
     args = parser.parse_args()
     
     # 將 output 參數作為 output_dir 傳遞給自動優化
-    if args.output:
-        args.output_dir = args.output
-    else:
-        args.output_dir = "reports"
+    if args.auto_optimize:
+        args.output_dir = args.output if args.output else "reports"
 
     try:
-        # 創建固定Channel基準測試器
+        # 創建基準測試器
         benchmark = FixedChannelBenchmark(
             model_name=args.model,
             device=args.device,
@@ -1312,7 +1372,7 @@ def main():
         
         # 執行基準測試
         if args.auto_optimize:
-            # 自動優化模式：測試從1到N個模型數量
+            # 自動優化模式：測試從批次大小1到N
             report = benchmark.run_auto_optimization(args)
         else:
             # 單次測試模式
@@ -1320,8 +1380,8 @@ def main():
                 video_path=args.video,
                 duration_seconds=args.seconds,
                 requested_channels=args.channels,
-                fixed_models=args.models,
-                output_file=args.output
+                output_file=args.output,
+                save_preview=args.save_preview
             )
         
         print("\n✅ 基準測試完成！")
